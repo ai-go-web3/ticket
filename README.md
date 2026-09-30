@@ -1,125 +1,119 @@
-# wxcloudrun-django
-[![GitHub license](https://img.shields.io/github/license/WeixinCloud/wxcloudrun-express)](https://github.com/WeixinCloud/wxcloudrun-express)
-![GitHub package.json dependency version (prod)](https://img.shields.io/badge/python-3.7.3-green)
+# 半岛电影 · 后端（Django + DRF）
 
-微信云托管 python Django 框架模版，实现简单的计数器读写接口，使用云托管 MySQL 读写、记录计数值。
-
-![](https://qcloudimg.tencent-cloud.cn/raw/be22992d297d1b9a1a5365e606276781.png)
-
+> 电影购票小程序后端。技术栈：**Django 4.2 + Django REST Framework + MySQL 8 + Redis**。
+> 供应商为**麻花电影（放单模式）**，方案详见 `../docs/` 目录。
+> 配套前端：`../web/`（原生微信小程序）。
 
 ## 快速开始
-前往 [微信云托管快速开始页面](https://developers.weixin.qq.com/miniprogram/dev/wxcloudrun/src/basic/guide.html)，选择相应语言的模板，根据引导完成部署。
 
-## 本地调试
-下载代码在本地调试，请参考[微信云托管本地调试指南](https://developers.weixin.qq.com/miniprogram/dev/wxcloudrun/src/guide/debug/)
+```bash
+# 1. 创建虚拟环境并安装依赖
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
 
-## 实时开发
-代码变动时，不需要重新构建和启动容器，即可查看变动后的效果。请参考[微信云托管实时开发指南](https://developers.weixin.qq.com/miniprogram/dev/wxcloudrun/src/guide/debug/dev.html)
+# 2. 配置环境变量
+cp .env.example .env   # 填写 MySQL / Redis / 微信 / 麻花 配置
 
-## Dockerfile最佳实践
-请参考[如何提高项目构建效率](https://developers.weixin.qq.com/miniprogram/dev/wxcloudrun/src/scene/build/speed.html)
+# 3. 建库 + 迁移（首次）
+# 手动创建数据库 movie_ticket（或执行 docs/schema.sql）
+python manage.py makemigrations
+python manage.py migrate
 
+# 4. 同步城市（国标↔麻花映射表灌库）
+python manage.py sync_city
 
-## 目录结构说明
-~~~
-.
-├── Dockerfile                  dockerfile
-├── README.md                   README.md文件
-├── container.config.json       模板部署「服务设置」初始化配置（二开请忽略）
-├── manage.py                   django项目管理文件 与项目进行交互的命令行工具集的入口
-├── requirements.txt            依赖包文件
-└── wxcloudrun                  app目录
-    ├── __init__.py             python项目必带  模块化思想
-    ├── apps.py                 自动生成文件apps.py
-    ├── asgi.py                 自动生成文件asgi.py, 异步服务网关接口
-    ├── migrations              数据移植（迁移）模块
-    ├── models.py               数据模块
-    ├── settings.py             项目的总配置文件  里面包含数据库 web应用 日志等各种配置
-    ├── templates               模版目录,包含主页index.html文件
-    ├── urls.py                 URL配置文件  Django项目中所有地址中（页面）都需要我们自己去配置其URL
-    ├── views.py                执行响应的代码所在模块  代码逻辑处理主要地点  项目大部分代码在此编写
-    └── wsgi.py                 自动生成文件wsgi.py, Web服务网关接口
-~~~
-
-
-## 服务 API 文档
-
-### `GET /api/count`
-
-获取当前计数
-
-#### 请求参数
-
-无
-
-#### 响应结果
-
-- `code`：错误码
-- `data`：当前计数值
-
-##### 响应结果示例
-
-```json
-{
-  "code": 0,
-  "data": 42
-}
+# 5. 启动
+python manage.py runserver
 ```
 
-#### 调用示例
+> **微信登录配置**：`.env` 里填 `WX_APPID` / `WX_SECRET`（小程序 AppID/AppSecret）。
+> 留空时登录走「开发降级」（`openid = dev_<code>`），可本地联调；生产必须配置。
+> 前端 `web/utils/config.js` 把 `USE_MOCK` 改为 `false`、`BASE_URL` 指向本后端即可打通登录。
+
+## 目录结构
 
 ```
-curl https://<云托管服务域名>/api/count
+ticket/
+├── config/                 # 项目配置（settings/urls/wsgi/asgi）
+│   ├── settings.py         # 数据库/Redis/DRF/微信/麻花/业务参数
+│   └── urls.py             # 主路由，挂载各业务模块
+├── apps/                   # 业务模块（按域分层）
+│   ├── common/             # 公共：统一响应/异常/JWT工具/幂等/中间件
+│   ├── auths/              # 登录态：wx.login、手机号绑定、JWT 鉴权
+│   ├── catalog/            # 基础数据：城市/影片/影院/排期
+│   ├── seat/               # 座位：本地锁座（Redis + DB 唯一键防超卖）
+│   ├── order/              # 订单：状态机、放单映射、支付流水、票券
+│   ├── pay/                # 支付：微信统一下单、支付回调
+│   ├── refund/             # 退款：拦截/纠纷/出票失败自动退
+│   ├── distributor/        # 分销：CPS 归因/佣金/钱包/提现/风控
+│   └── upadapter/          # 上游适配：麻花 SPI 客户端、token 缓存、回调入口
+├── manage.py
+├── requirements.txt
+└── .env.example
 ```
 
+## 模块职责
 
+| 模块 | 职责 | 关键设计 |
+|---|---|---|
+| `common` | 统一响应 `{code,msg,data,traceId}`、`BizError`、JWT 工具、幂等、对账/任务日志表 | 全项目基础设施 |
+| `auths` | wx.login→openid→签发 JWT；getPhoneNumber 绑定手机号 | token 用内部 JWT |
+| `catalog` | 城市/影片/影院/排期查询 | 数据由麻花回调同步落库 |
+| `seat` | 本地锁座并发控制 | **Redis 快路径 + DB 唯一键兜底**，最终以麻花放单结果收敛 |
+| `order` | 订单状态机（集中管理迁移）、建单、放单映射、票券 | 状态机禁止散落改 status，带 version 乐观锁 |
+| `pay` | 微信统一下单、支付回调（验签→幂等→触发出票） | 先支付后放单 |
+| `refund` | 拦截（未出票）/纠纷（已出票）/出票失败自动退 | 先麻花受理后退用户 |
+| `distributor` | 归因绑定、计佣、钱包 CAS、提现冻结 | 层级≤2、T+N 结算 |
+| `upadapter` | 麻花 SPI 接口、token 缓存（2h）、回调入口 | 严禁每请求取 token |
 
-### `POST /api/count`
+## 核心设计
 
-更新计数，自增或者清零
-
-#### 请求参数
-
-- `action`：`string` 类型，枚举值
-  - 等于 `"inc"` 时，表示计数加一
-  - 等于 `"clear"` 时，表示计数重置（清零）
-
-##### 请求参数示例
-
+### 订单状态机
 ```
-{
-  "action": "inc"
-}
+待支付(10) → 出票中(20) → 待取票(30) → 已完成(40)
+   │            │            │
+   └→已关闭(50) └→出票失败(60)└→退款中(70)→已退款(80)
+                                   └→纠纷中(90)
+```
+状态迁移集中在 `apps/order/statemachine.py`，非法迁移直接拒绝。
+
+### 锁座防超卖（双层）
+1. Redis 分布式锁（快路径，Lua/setnx 原子占用）
+2. MySQL 唯一键 `seat_lock_item(schedule_id, seat_no)`（兜底，Redis 抖动时插入冲突即失败）
+
+> 麻花无锁座接口，座位最终可得以「放单」结果收敛；放单失败自动退款引导重选。
+
+### 金额
+统一以「分」存 BIGINT，避免浮点误差。前端展示时转「元」。
+
+## API 一览（前缀 /api/v1）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/auth/wx-login` | 微信登录 |
+| POST | `/auth/bind-phone` | 绑定手机号 |
+| GET | `/catalog/cities` `/movies` `/cinemas` `/schedules` | 基础数据 |
+| POST | `/seat/lock` `/seat/release` | 锁座/释放 |
+| POST | `/order/` | 建单 |
+| GET | `/order/list` `/order/{id}` | 订单列表/详情 |
+| POST | `/order/{id}/cancel` `/order/{id}/refund` | 取消/退款 |
+| POST | `/pay/unified` `/pay/callback` | 统一下单/支付回调 |
+| GET | `/distributor/summary` `/team` `/wallet` `/commissions` | 分销 |
+| POST | `/distributor/bind` `/distributor/withdraw` | 归因/提现 |
+| POST | `/up/callback/order` `/up/callback/dispute` | 麻花回调 |
+
+## 测试
+
+```bash
+# 冒烟测试（用 SQLite 跑通核心闭环：鉴权/锁座/防超卖/建单）
+# 见 docs 或直接跑 django check
+python manage.py check
 ```
 
-#### 响应结果
+## 待办（P0 收尾）
 
-- `code`：错误码
-- `data`：当前计数值
-
-##### 响应结果示例
-
-```json
-{
-  "code": 0,
-  "data": 42
-}
-```
-
-#### 调用示例
-
-```
-curl -X POST -H 'content-type: application/json' -d '{"action": "inc"}' https://<云托管服务域名>/api/count
-```
-
-## 使用注意
-如果不是通过微信云托管控制台部署模板代码，而是自行复制/下载模板代码后，手动新建一个服务并部署，需要在「服务设置」中补全以下环境变量，才可正常使用，否则会引发无法连接数据库，进而导致部署失败。
-- MYSQL_ADDRESS
-- MYSQL_PASSWORD
-- MYSQL_USERNAME
-以上三个变量的值请按实际情况填写。如果使用云托管内MySQL，可以在控制台MySQL页面获取相关信息。
-
-
-## License
-
-[MIT](./LICENSE)
+- [ ] 接 Celery 把放单/出票轮询转异步（当前同步调用）
+- [ ] 微信支付回调完整验签
+- [ ] 麻花字段级映射（待 apifox 正式报文）
+- [ ] 排片/影片同步定时任务（麻花回调 + 定时兜底）
+- [ ] 对账批任务

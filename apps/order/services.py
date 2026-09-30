@@ -1,0 +1,128 @@
+"""订单服务：建单 / 触发放单 / 查询。"""
+import json
+import logging
+
+from django.db import transaction
+
+from apps.common.response import BizError, ErrorCode
+from apps.common.utils import gen_order_ext_no
+from apps.order.models import TicketOrder, OrderPayment, MahuaDispatch
+from apps.seat.services import verify_lock, consume_lock
+from apps.catalog import services as catalog_services
+from apps.catalog.models import Schedule, Movie, Cinema
+
+logger = logging.getLogger('app')
+
+
+def create_order(user_id, payload):
+    """建「待支付」单。
+
+    payload: { lockToken, scheduleId, seats, mobile, discountAmount }
+    """
+    lock_token = payload['lockToken']
+    schedule_id = payload['scheduleId']
+    seats = payload['seats']
+    mobile = payload.get('mobile')
+    discount = payload.get('discountAmount', 0)
+
+    # 1. 校验锁
+    lock = verify_lock(lock_token, schedule_id)
+
+    # 2. 校验场次可售（未删 + 在售 + 未过停售线，与列表/选座/锁座同一口径）
+    try:
+        schedule = Schedule.objects.get(id=schedule_id, deleted=0)
+    except Schedule.DoesNotExist:
+        raise BizError('场次不存在', code=40400)
+    catalog_services.ensure_sellable(schedule)
+
+    # 3. 计算金额（分）
+    ticket_amount = sum(int(s['price']) for s in seats)
+    service_fee = 300 * len(seats)  # 服务费 3元/座
+    pay_amount = ticket_amount + service_fee - discount
+    if pay_amount < 0:
+        pay_amount = 0
+
+    # 4. 落单（幂等：同一 lockToken 重复建单返回原单）
+    existing = TicketOrder.objects.filter(
+        user_id=user_id, lock_token=lock_token, deleted=0,
+    ).first()
+    if existing:
+        return existing
+
+    order = TicketOrder.objects.create(
+        order_ext_no=gen_order_ext_no(),
+        user_id=user_id,
+        schedule_id=schedule_id,
+        cinema_id=schedule.cinema_id,
+        movie_id=schedule.movie_id,
+        up_schedule_id=schedule.up_schedule_id,
+        seats_json=json.dumps(seats, ensure_ascii=False),
+        seat_count=len(seats),
+        ticket_amount=ticket_amount,
+        service_fee=service_fee,
+        discount_amount=discount,
+        pay_amount=pay_amount,
+        mobile=mobile,
+        status=TicketOrder.STATUS_PAYING,
+        lock_token=lock_token,
+    )
+    return order
+
+
+def mark_paid(order_id, pay_no, amount, callback_raw=None):
+    """支付成功回调：标记已付 + 生成支付流水 + 触发放单（异步，此处同步模拟）。"""
+    from apps.order.statemachine import transition
+
+    try:
+        order = TicketOrder.objects.get(id=order_id, deleted=0)
+    except TicketOrder.DoesNotExist:
+        raise BizError('订单不存在', code=ErrorCode.ORDER_NOT_EXIST)
+
+    if order.status != TicketOrder.STATUS_PAYING:
+        # 已处理，幂等返回
+        return order
+
+    with transaction.atomic():
+        # 支付流水（pay_no 唯一幂等）
+        _, created = OrderPayment.objects.get_or_create(
+            pay_no=pay_no,
+            defaults={
+                'order_id': order_id,
+                'amount': amount,
+                'status': OrderPayment.STATUS_SUCCESS,
+                'callback_raw': callback_raw,
+            },
+        )
+        if not created:
+            return order  # 重复回调
+
+        order.pay_status = TicketOrder.PAY_DONE
+        order.save(update_fields=['pay_status', 'updated_at'])
+
+        # 状态迁移：待支付 -> 出票中
+        transition(order, TicketOrder.STATUS_DISPATCHING)
+
+        # 消费锁
+        if order.lock_token:
+            consume_lock(order.lock_token, order_id)
+
+    # 触发放单（真实场景走 MQ/Celery 异步；骨架阶段同步调用）
+    # 放单失败不阻塞支付成功：订单已标记「出票中」，放单可重试/异步补偿。
+    # TODO: 接入 Celery 后改为 dispatch_task.delay(order.order_ext_no)
+    try:
+        from apps.upadapter.client import dispatch
+        dispatch(order.order_ext_no)
+    except Exception as exc:  # noqa: BLE001
+        logger.error('放单失败（待重试） order=%s err=%s', order.order_ext_no, exc)
+    return order
+
+
+def query_order(order_id, user_id=None):
+    """查询订单详情。"""
+    try:
+        order = TicketOrder.objects.get(id=order_id, deleted=0)
+    except TicketOrder.DoesNotExist:
+        raise BizError('订单不存在', code=ErrorCode.ORDER_NOT_EXIST)
+    if user_id is not None and order.user_id != user_id:
+        raise BizError('无权查看该订单', code=ErrorCode.FORBIDDEN)
+    return order
