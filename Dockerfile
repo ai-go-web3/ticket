@@ -28,6 +28,11 @@ RUN pip install --no-cache-dir -i https://mirrors.cloud.tencent.com/pypi/simple 
 # 拷贝项目代码
 COPY . .
 
+# 启动入口：信任云托管注入的自签证书（修复容器内调 api.weixin.qq.com 的
+# CERTIFICATE_VERIFY_FAILED），再执行 CMD
+RUN chmod +x /app/entrypoint.sh
+ENTRYPOINT ["/app/entrypoint.sh"]
+
 # 收集静态文件（如有 admin/static）
 RUN python manage.py collectstatic --noinput || true
 

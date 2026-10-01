@@ -1,6 +1,7 @@
 """auths 视图。"""
 import logging
 
+import requests
 from django.utils import timezone
 from rest_framework.decorators import api_view, permission_classes, authentication_classes
 from rest_framework.permissions import AllowAny
@@ -9,7 +10,7 @@ from apps.auths.models import AppUser
 from apps.auths.authentication import gen_token
 from apps.auths.serializers import WxLoginSerializer, BindPhoneSerializer, UserSerializer
 from apps.auths.wechat import code2session, get_phone
-from apps.common.response import ok, BizError
+from apps.common.response import ok, BizError, ErrorCode
 
 logger = logging.getLogger('app')
 
@@ -27,6 +28,9 @@ def wx_login(request):
         sess = code2session(code)
     except ValueError as e:
         raise BizError(str(e), code=40100)
+    except requests.RequestException as e:
+        logger.error('code2session 网络异常: %s', e)
+        raise BizError('微信接口暂时不可达，请稍后重试', code=ErrorCode.UP_ERROR)
 
     openid = sess['openid']
     unionid = sess.get('unionid')
@@ -57,6 +61,9 @@ def bind_phone(request):
         phone_info = get_phone(code)
     except ValueError as e:
         raise BizError(str(e), code=40100)
+    except requests.RequestException as e:
+        logger.error('get_phone 网络异常: %s', e)
+        raise BizError('微信接口暂时不可达，请稍后重试', code=ErrorCode.UP_ERROR)
 
     phone = phone_info['phone']
     mask = phone[:3] + '****' + phone[-4:]

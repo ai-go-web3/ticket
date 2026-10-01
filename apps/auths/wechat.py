@@ -1,10 +1,39 @@
 """微信小程序服务：code2Session / getPhoneNumber。"""
 import logging
+import os
 
 import requests
 from django.conf import settings
 
 logger = logging.getLogger('app')
+
+_WX_HTTPS = 'https://api.weixin.qq.com'
+_WX_HTTP = 'http://api.weixin.qq.com'  # 云托管内网链路（开放接口服务会接管该域名的 HTTPS）
+
+
+def _wx_api(method, path, **kwargs):
+    """请求微信开放接口（api.weixin.qq.com），带 SSL 降级。
+
+    背景：微信云托管开启「开放接口服务/云调用」后，容器内对该域名的 HTTPS 请求
+    会被平台旁挂组件接管并出示自签证书；Python requests 默认用 certifi 信任库，
+    不认该证书，报 CERTIFICATE_VERIFY_FAILED(self-signed certificate)。
+
+    处理策略（与 Dockerfile entrypoint.sh 配合）：
+      1. 首选 HTTPS 严格校验（entrypoint.sh 已把 REQUESTS_CA_BUNDLE 指向系统
+         信任库，平台自签证书已合入其中，正常情况下直接通过）；
+      2. 若仍报 SSLError，自动降级为 HTTP 内网链路重试（云托管容器与微信 API
+         同内网，明文可接受；本地环境一般不会触发此分支）；
+      3. 设 WX_HTTP_STRICT_SSL=true 可强制严格模式（禁止降级）。
+    """
+    kwargs.setdefault('timeout', 5)
+    strict = os.environ.get('WX_HTTP_STRICT_SSL', '').strip().lower() in ('1', 'true', 'yes')
+    try:
+        return requests.request(method, f'{_WX_HTTPS}{path}', **kwargs)
+    except requests.exceptions.SSLError as e:
+        if strict:
+            raise
+        logger.warning('微信接口 HTTPS 证书校验失败（疑似云托管旁挂组件接管），降级 HTTP 重试: %s', e)
+        return requests.request(method, f'{_WX_HTTP}{path}', **kwargs)
 
 
 def _is_dev_fallback():
@@ -29,13 +58,13 @@ def code2session(code):
             'unionid': None,
         }
 
-    url = 'https://api.weixin.qq.com/sns/jscode2session'
-    resp = requests.get(url, params={
+    url_path = '/sns/jscode2session'
+    resp = _wx_api('GET', url_path, params={
         'appid': appid,
         'secret': secret,
         'js_code': code,
         'grant_type': 'authorization_code',
-    }, timeout=5)
+    })
     data = resp.json()
     if 'openid' not in data:
         logger.error('code2session failed: %s', data)
@@ -56,12 +85,11 @@ def _get_access_token():
     if token:
         return token
 
-    url = 'https://api.weixin.qq.com/cgi-bin/token'
-    resp = requests.get(url, params={
+    resp = _wx_api('GET', '/cgi-bin/token', params={
         'grant_type': 'client_credential',
         'appid': appid,
         'secret': secret,
-    }, timeout=5)
+    })
     data = resp.json()
     if 'access_token' not in data:
         logger.error('get access_token failed: %s', data)
@@ -82,12 +110,11 @@ def get_phone(code):
         raise ValueError('未配置 WX_APPID/WX_SECRET，无法换取真实手机号')
 
     access_token = _get_access_token()
-    url = 'https://api.weixin.qq.com/wxa/business/getuserphonenumber'
-    resp = requests.post(
-        url,
+    resp = _wx_api(
+        'POST',
+        '/wxa/business/getuserphonenumber',
         params={'access_token': access_token},
         json={'code': code},
-        timeout=5,
     )
     data = resp.json()
     if data.get('errcode') != 0:
