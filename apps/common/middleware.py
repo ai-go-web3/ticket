@@ -36,3 +36,52 @@ class GlobalExceptionMiddleware:
                 {'code': 50000, 'msg': '服务器内部错误', 'data': None},
                 status=500,
             )
+
+
+# 需要登录态的接口前缀（其余如 catalog / wx-login / 各类回调 / sync-movies / health 均公开）
+PROTECTED_PREFIXES = (
+    '/api/v1/order',
+    '/api/v1/seat',
+    '/api/v1/distributor',
+    '/api/v1/refund',
+    '/api/v1/pay/unified',
+    '/api/v1/pay/mock',
+    '/api/v1/auth/profile',
+    '/api/v1/auth/bind-phone',
+)
+
+
+class JWTAuthMiddleware:
+    """统一登录态校验：受保护接口无有效 token 时返回 401（触发前端静默重登），
+    有效时把 user_id 挂到 request 上供视图使用。公开接口一律放行。"""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    @staticmethod
+    def _resolve_user_id(request):
+        """从 Authorization: Bearer <token> 解析 user_id，失败返回 None。"""
+        auth = request.headers.get('Authorization', '')
+        if not auth.startswith('Bearer '):
+            return None
+        from apps.auths.authentication import decode_token
+        from apps.auths.models import AppUser
+        try:
+            payload = decode_token(auth[7:].strip())
+            return AppUser.objects.filter(id=payload.get('uid'), deleted=0).values_list('id', flat=True).first()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def __call__(self, request):
+        path = request.path
+        uid = self._resolve_user_id(request)
+        if uid is not None:
+            request.user_id = uid  # 公开接口若带有效 token 也顺带注入
+
+        protected = any(path.startswith(p) for p in PROTECTED_PREFIXES)
+        if protected and request.method != 'OPTIONS' and uid is None:
+            return JsonResponse(
+                {'code': 40100, 'msg': '未登录或登录已失效', 'data': None},
+                status=401,
+            )
+        return self.get_response(request)

@@ -16,6 +16,7 @@ from django.core.management.base import BaseCommand
 
 from apps.catalog.models import Movie
 from apps.upadapter.mahua import MahuaClient
+from apps.upadapter.token import get_token
 
 
 def _parse_release(value):
@@ -40,11 +41,11 @@ class Command(BaseCommand):
         pages = options['pages']
         client = MahuaClient()
 
-        token, username = client.fetch_token()
+        token = get_token()
         if not token:
-            self.stderr.write(self.style.ERROR('麻花登录失败，无法获取 token'))
+            self.stderr.write(self.style.ERROR('麻花 token 获取失败，无法同步'))
             return
-        self.stdout.write(f'登录成功：{username}，token={token[:8]}...')
+        self.stdout.write(f'使用麻花 token={token[:8]}...')
 
         today = date.today()
         hot_created, hot_updated = self._sync_list(

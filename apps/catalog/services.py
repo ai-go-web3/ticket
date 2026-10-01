@@ -1,7 +1,11 @@
 """catalog 数据同步服务：麻花回调增量入库（电影 / 排片 / 城市）。"""
+import io
 import logging
 from datetime import timedelta
 
+from django.conf import settings
+from django.core.cache import cache
+from django.core.management import call_command
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
@@ -11,6 +15,10 @@ from apps.catalog.city_mapping import (
 )
 
 logger = logging.getLogger('app')
+
+# 影片同步并发锁：内置定时器与运维 HTTP 接口共用，保证同一时刻只真正执行一次
+SYNC_LOCK_KEY = 'task:sync_movies_lock'
+SYNC_LOCK_TTL = 300  # 秒；异常卡死也会自动释放
 
 
 def sync_cities(city_list):
@@ -319,7 +327,7 @@ def pull_regions(mahua_city_id, date=None, up_movie_id=None, ttl=300):
 
     区域列表相对稳定且打开下拉即拉，故加短 TTL 缓存（默认 300s）按
     city+date+film 维度去重，减轻麻花限频压力。缓存层用 Django cache 框架
-    （生产 Redis / 本地 LocMem），异常时降级为直连、不影响可用性。
+    （进程内 LocMem），异常时降级为直连、不影响可用性。
     """
     from django.core.cache import cache
     key = 'mahua:regions:%s:%s:%s' % (mahua_city_id, date or '-', up_movie_id or '-')
@@ -372,13 +380,22 @@ def pull_schedules(mahua_cinema_id, up_movie_id=None):
     return qs.order_by('start_at')
 
 
+def _seat_sale_price(price_fen, fast_fen, max_speed_fen):
+    """优惠出票价：fastPrice 优先，缺失/非正则取 maxSpeedPrice，再兜底原价。"""
+    for v in (fast_fen, max_speed_fen):
+        if v and v > 0:
+            return v
+    return price_fen
+
+
 def pull_seats(show_id):
     """实时拉取座位情况（禁缓存，逐次调用）。
 
     show_id：麻花 showId（=Schedule.up_schedule_id）。
     返回 (rows, restrictions, min_price_fen)：
-        rows: [{'row': int, 'seats': [{col,name,seatId,status,price}, ...]}, ...]
-        price 单位为分；status 0可售/1已售/3不可售。
+        rows: [{'row': int, 'seats': [{col,name,seatId,status,price,salePrice}, ...]}, ...]
+        price/salePrice 单位为分；status 0可售/1已售/3不可售。
+        price=票面原价；salePrice=优惠价（fastPrice 优先，无则 maxSpeedPrice，再无原价）。
     """
     client, token = _mahua()
     code, data = client.get_seats_realtime(token, show_id)
@@ -396,12 +413,17 @@ def pull_seats(show_id):
         except (TypeError, ValueError):
             continue
         price_fen = _parse_price(s.get('price'))
+        fast_fen = _parse_price(s.get('fastPrice'))
+        max_speed_fen = _parse_price(s.get('maxSpeedPrice'))
         seat = {
             'col': c,
             'name': s.get('seatNo'),                 # 展示 + 放单 row/col 从此名解析
             'seatId': s.get('seatId'),               # 放单主用此参数
             'status': _MAHUA_SEAT_STATUS.get(s.get('status'), 3),
             'price': price_fen,
+            'salePrice': _seat_sale_price(price_fen, fast_fen, max_speed_fen),
+            'fastPrice': fast_fen,          # 快速出票价（分），放单 model=1
+            'maxSpeedPrice': max_speed_fen, # 极速/更深优惠价（分），放单 model=2
             'lovestatus': s.get('lovestatus', 0),
             'area': s.get('area'),
         }
@@ -414,3 +436,37 @@ def pull_seats(show_id):
 
     min_price = min((sf['price'] for sr in rows for sf in sr['seats'] if sf['price']), default=None)
     return rows, restrictions, min_price
+
+
+def run_movie_sync(city=None, pages=1):
+    """执行一次影片同步（热映+待映），带缓存锁防同进程内并发重叠。
+
+    供内置定时器（APScheduler）与运维 HTTP 接口共用。
+    锁用 Django cache（进程内 LocMem），同一进程内同一时刻只有一个真正执行；
+    多副本间不共享（LocMem 为进程内），建议单副本常驻。
+
+    返回：{ran: bool, skipped: bool, city, pages, log}；异常时附 error。
+    """
+    city = str(city or getattr(settings, 'SYNC_DEFAULT_CITY', '8'))
+    try:
+        pages = int(pages)
+    except (TypeError, ValueError):
+        pages = 1
+    pages = max(1, min(pages, 10))
+
+    if not cache.add(SYNC_LOCK_KEY, '1', timeout=SYNC_LOCK_TTL):
+        logger.info('sync_movies 跳过：已有同步在执行')
+        return {'ran': False, 'skipped': True, 'city': city, 'pages': pages, 'log': ''}
+
+    try:
+        out = io.StringIO()
+        call_command('sync_movies', city=city, pages=pages, stdout=out, stderr=out)
+        log = out.getvalue()
+        logger.info('sync_movies 完成 city=%s pages=%s', city, pages)
+        return {'ran': True, 'skipped': False, 'city': city, 'pages': pages, 'log': log}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception('sync_movies 执行失败：%s', exc)
+        return {'ran': False, 'skipped': False, 'error': str(exc),
+                'city': city, 'pages': pages, 'log': ''}
+    finally:
+        cache.delete(SYNC_LOCK_KEY)

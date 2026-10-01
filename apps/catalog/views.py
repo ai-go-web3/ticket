@@ -1,12 +1,9 @@
 """catalog 视图：城市/影片/影院/排期查询。"""
 import hmac
-import io
 from datetime import timedelta
 from math import asin, cos, radians, sin, sqrt
 
 from django.conf import settings
-from django.core.cache import cache
-from django.core.management import call_command
 from django.db.models import Count, Q
 from django.utils import timezone
 from rest_framework.decorators import api_view, permission_classes
@@ -327,18 +324,17 @@ def coming_calendar(request):
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def sync_movies(request):
-    """运维：触发热映/待映影片同步（供微信云托管「定时任务」调用，也可手动 POST 测试）。
+    """运维：手动/外部触发热映+待映影片同步（也可用于本地联调）。
 
-    复用 management 命令 sync_movies：登录麻花 → 拉热映+待映 → upsert 入库。
+    与内置定时器共用 catalog_services.run_movie_sync（含进程内缓存锁去重）。
 
     鉴权（fail-closed）：
       - 服务端未配置 TASK_TOKEN 时一律拒绝。
       - 调用方需携带与 TASK_TOKEN 一致的令牌，取值顺序：
         header `X-Task-Token` > query `?token=` > body(JSON/form) `token`。
-    并发保护：cache 锁，避免定时任务与手动触发/平台重试重叠执行。
 
     body（可选）：{ "city": "8", "pages": 1 }
-    返回：{ code, msg, data: {city, pages, skipped, log} }
+    返回：{ code, msg, data: {ran, skipped, city, pages, log} }
     """
     expected = getattr(settings, 'TASK_TOKEN', '') or ''
     if not expected:
@@ -353,23 +349,10 @@ def sync_movies(request):
     if not hmac.compare_digest(str(provided), str(expected)):
         return fail('令牌无效', code=ErrorCode.UNAUTHORIZED)
 
-    lock_key = 'task:sync_movies_lock'
-    # 锁最长 5 分钟；正常同步约 1~2s，异常卡死也会自动释放
-    if not cache.add(lock_key, '1', timeout=300):
-        return ok({'skipped': True, 'reason': 'already_running'}, msg='已有同步任务在执行，本次跳过')
-
-    try:
-        body = request.data if isinstance(request.data, dict) else {}
-        city = str(body.get('city') or getattr(settings, 'SYNC_DEFAULT_CITY', '8'))
-        try:
-            pages = int(body.get('pages') or 1)
-        except (TypeError, ValueError):
-            pages = 1
-        pages = max(1, min(pages, 10))
-
-        out = io.StringIO()
-        call_command('sync_movies', city=city, pages=pages, stdout=out, stderr=out)
-        return ok({'city': city, 'pages': pages, 'skipped': False, 'log': out.getvalue()},
-                  msg='同步完成')
-    finally:
-        cache.delete(lock_key)
+    body = request.data if isinstance(request.data, dict) else {}
+    res = catalog_services.run_movie_sync(city=body.get('city'), pages=body.get('pages', 1))
+    if res.get('skipped'):
+        return ok({**res, 'reason': 'already_running'}, msg='已有同步任务在执行，本次跳过')
+    if res.get('error'):
+        return fail(res['error'], code=ErrorCode.UP_ERROR)
+    return ok(res, msg='同步完成')

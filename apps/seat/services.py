@@ -1,8 +1,7 @@
-"""锁座核心服务。
+"""锁座核心服务（纯数据库实现，不依赖 Redis）。
 
-双层防护：
-1. Redis 分布式锁（快路径，Lua 原子校验）
-2. MySQL 唯一键 (schedule_id, seat_no) 兜底（Redis 抖动时插入冲突即失败）
+防超卖靠 MySQL 唯一键 seat_lock_item.(schedule_id, seat_no)：同一座位并发锁时，
+第二条插入触发 IntegrityError 即失败。锁的存活/过期由 seat_lock.expire_at + 兜底扫描维护。
 
 最终座位是否可得以麻花「放单」结果收敛（麻花无锁座接口）。
 """
@@ -13,7 +12,6 @@ from datetime import timedelta
 from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.utils import timezone
-from django_redis import get_redis_connection
 
 from apps.common.response import BizError, ErrorCode
 from apps.common.utils import gen_lock_token
@@ -22,12 +20,8 @@ from apps.seat.models import SeatLock, SeatLockItem
 logger = logging.getLogger('app')
 
 
-def _redis_key(schedule_id, seat_no):
-    return f'seat:lock:{schedule_id}:{seat_no}'
-
-
 def _release_expired(schedule_id):
-    """释放该场次已过期的锁（DB 层面兜底扫描）。"""
+    """释放该场次已过期的锁（DB 层面兜底扫描，删除 item 以释放唯一键）。"""
     now = timezone.now()
     expired = SeatLock.objects.filter(
         schedule_id=schedule_id, status=SeatLock.STATUS_HOLD, expire_at__lt=now,
@@ -61,40 +55,16 @@ def lock_seats(user_id, schedule_id, seats):
 
     seat_nos = [s['name'] for s in seats]
 
-    # 1. 清理过期锁
+    # 1. 清理过期锁（释放被超时占用的唯一键）
     _release_expired(schedule_id)
 
-    # 2. 尝试 Redis 快路径占用（不可用则降级到纯 DB 唯一键）
+    # 2. DB 唯一键原子占用（防超卖）
     ttl = getattr(settings, 'SEAT_LOCK_TTL', 600)
-    redis_conn = None
-    redis_occupied = []
-    try:
-        redis_conn = get_redis_connection('default')
-        pipe = redis_conn.pipeline(transaction=True)
-        for seat_no in seat_nos:
-            pipe.setnx(_redis_key(schedule_id, seat_no), str(user_id))
-            pipe.expire(_redis_key(schedule_id, seat_no), ttl)
-        results = pipe.execute()
-        # results: [setnx_result, expire_result, setnx_result, expire_result, ...]
-        setnx_results = results[0::2]
-        if not all(setnx_results):
-            # 有座位已被占用 -> 回滚已占用的
-            for i, ok_flag in enumerate(setnx_results):
-                if ok_flag:
-                    redis_conn.delete(_redis_key(schedule_id, seat_nos[i]))
-            raise BizError('座位已被抢先，请重新选择', code=ErrorCode.SEAT_TAKEN)
-        redis_occupied = seat_nos[:]
-    except Exception as exc:  # noqa: BLE001
-        # Redis 不可用 -> 降级到 DB 唯一键兜底（核心防超卖仍在）
-        logger.warning('redis unavailable, fallback to db lock: %s', exc)
-        redis_conn = None
-
-    # 3. DB 唯一键兜底（最终防超卖）
     lock_token = gen_lock_token()
     expire_at = timezone.now() + timedelta(seconds=ttl)
     try:
         with transaction.atomic():
-            lock = SeatLock.objects.create(
+            SeatLock.objects.create(
                 lock_token=lock_token,
                 schedule_id=schedule_id,
                 user_id=user_id,
@@ -108,17 +78,13 @@ def lock_seats(user_id, schedule_id, seats):
                 for n in seat_nos
             ])
     except IntegrityError:
-        # DB 唯一键冲突 -> 释放 redis 占用
-        if redis_conn and redis_occupied:
-            for seat_no in redis_occupied:
-                redis_conn.delete(_redis_key(schedule_id, seat_no))
         raise BizError('座位已被抢先，请重新选择', code=ErrorCode.SEAT_TAKEN)
 
     return lock_token, ttl, seat_nos
 
 
 def release_lock(lock_token, expired=False):
-    """释放锁（下单前取消/过期）。"""
+    """释放锁（下单前取消/过期）。删除 item 即释放座位唯一键，可被重新锁定。"""
     try:
         lock = SeatLock.objects.get(lock_token=lock_token)
     except SeatLock.DoesNotExist:
@@ -130,18 +96,11 @@ def release_lock(lock_token, expired=False):
     SeatLock.objects.filter(lock_token=lock_token, status=SeatLock.STATUS_HOLD).update(
         status=new_status,
     )
-    # 释放 redis + DB item
-    try:
-        redis_conn = get_redis_connection('default')
-        for item in SeatLockItem.objects.filter(lock_token=lock_token):
-            redis_conn.delete(_redis_key(item.schedule_id, item.seat_no))
-    except Exception:  # noqa: BLE001
-        pass  # Redis 不可用时忽略，DB item 已删除即可
     SeatLockItem.objects.filter(lock_token=lock_token).delete()
 
 
 def consume_lock(lock_token, order_id):
-    """锁 -> 已下单（下单成功后调用）。"""
+    """锁 -> 已下单（下单成功后调用）。item 保留，座位随订单锁定，不再释放唯一键。"""
     SeatLock.objects.filter(lock_token=lock_token, status=SeatLock.STATUS_HOLD).update(
         status=SeatLock.STATUS_CONSUMED, order_id=order_id,
     )

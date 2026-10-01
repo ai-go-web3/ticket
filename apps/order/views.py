@@ -12,12 +12,22 @@ from apps.order.serializers import OrderSerializer, TicketSerializer
 logger = logging.getLogger('app')
 
 
+# 「我的」页四态入口 -> TicketOrder.status 集合映射
+ORDER_TAB_STATUS = {
+    'paying': [TicketOrder.STATUS_PAYING],                                   # 待付款
+    'ticketing': [TicketOrder.STATUS_DISPATCHING],                           # 出票中
+    'issued': [TicketOrder.STATUS_WAIT_PICK, TicketOrder.STATUS_DONE],       # 已出票
+    'refunded': [TicketOrder.STATUS_REFUNDING, TicketOrder.STATUS_REFUNDED], # 已退款
+}
+
+
 class CreateOrderSerializer(serializers.Serializer):
-    lockToken = serializers.CharField()
     scheduleId = serializers.IntegerField()
     seats = serializers.ListField(child=serializers.DictField())
     mobile = serializers.CharField(required=False, allow_blank=True)
     discountAmount = serializers.IntegerField(required=False, default=0)
+    # 可选：前端选座后不再预锁座，未传时建单现场锁座
+    lockToken = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
 
 @api_view(['POST'])
@@ -41,13 +51,26 @@ def order_detail(request, order_id):
 
 @api_view(['GET'])
 def my_orders(request):
-    """我的订单列表。"""
-    status = request.query_params.get('status')
+    """我的订单列表。支持 tab（四态分组）或 status（单一状态）过滤。"""
     qs = TicketOrder.objects.filter(user_id=request.user_id, deleted=0)
-    if status:
+    tab = request.query_params.get('tab')
+    status = request.query_params.get('status')
+    if tab and tab in ORDER_TAB_STATUS:
+        qs = qs.filter(status__in=ORDER_TAB_STATUS[tab])
+    elif status:
         qs = qs.filter(status=status)
     qs = qs.order_by('-created_at')
     return ok(OrderSerializer(qs, many=True).data)
+
+
+@api_view(['GET'])
+def order_count(request):
+    """我的订单四态计数（供「我的」页角标）。"""
+    base = TicketOrder.objects.filter(user_id=request.user_id, deleted=0)
+    return ok({
+        tab: base.filter(status__in=statuses).count()
+        for tab, statuses in ORDER_TAB_STATUS.items()
+    })
 
 
 @api_view(['POST'])

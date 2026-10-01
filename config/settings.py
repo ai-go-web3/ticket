@@ -50,6 +50,7 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'apps.common.middleware.RequestTraceMiddleware',   # traceId + 请求日志
+    'apps.common.middleware.JWTAuthMiddleware',        # 统一登录态校验（受保护接口 401）
     'apps.common.middleware.GlobalExceptionMiddleware',  # 统一异常处理
 ]
 
@@ -93,36 +94,19 @@ DATABASES = {
     }
 }
 
-# ===== 缓存 / 会话（Redis）=====
-# USE_REDIS：是否启用 Redis 作为缓存后端。
-#   true  = 生产标准（锁座快路径、token 缓存走 Redis，需 Redis 可达）
-#   false = 降级为本地内存缓存（LocMemCache），后端无需 Redis 也能跑通。
-#           注意：LocMemCache 是单进程内存，gunicorn 多 worker 下各进程缓存不共享，
-#           锁座会退化为「纯 DB 唯一键兜底」（防超卖仍有效），token 缓存每进程各自维护。
-#           正式上线选座/高并发场景必须设为 true 并配置 Redis。
-USE_REDIS = os.environ.get('USE_REDIS', 'false').lower() == 'true'
-
-REDIS_HOST = os.environ.get('REDIS_HOST', '127.0.0.1')
-REDIS_PORT = int(os.environ.get('REDIS_PORT', '6379'))
-REDIS_DB = int(os.environ.get('REDIS_DB', '0'))
-REDIS_PASSWORD = os.environ.get('REDIS_PASSWORD', '')
-
-if USE_REDIS:
-    CACHES = {
-        'default': {
-            'BACKEND': 'django_redis.cache.RedisCache',
-            'LOCATION': f'redis://:{REDIS_PASSWORD}@{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}',
-            'OPTIONS': {'CLIENT_CLASS': 'django_redis.client.DefaultClient'},
-        }
+# ===== 缓存 / 会话（进程内内存，不依赖 Redis）=====
+# 全项目已去除 Redis。Django cache 用于：麻花 token 缓存、影院区域缓存、
+# 同步/token 刷新去重锁、微信 access_token 缓存等，均走进程内 LocMemCache。
+# 注意：LocMemCache 为单进程内存，多 worker/多副本间不共享——
+#   · 座位防超卖不受影响（靠 MySQL 唯一键 seat_lock_item，非缓存）；
+#   · token 缓存/同步锁变为「每进程各自维护」，建议单副本常驻，
+#     或接受各进程独立刷新 token（登录频率仍远低于「每请求」）。
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'ticket',
     }
-else:
-    # Redis 未启用时降级为本地内存缓存，避免 cache 调用抛连接异常导致接口 500。
-    CACHES = {
-        'default': {
-            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
-            'LOCATION': 'ticket-prod',
-        }
-    }
+}
 
 # ===== DRF =====
 REST_FRAMEWORK = {
@@ -174,11 +158,16 @@ PAY_TIMEOUT = int(os.environ.get('PAY_TIMEOUT', '900'))        # 支付 15 分�
 JWT_EXPIRE_SECONDS = int(os.environ.get('JWT_EXPIRE_SECONDS', '7200'))
 
 # ===== 运维/定时任务 =====
-# 内部定时任务接口（如影片同步）的共享令牌。由微信云托管「定时任务」在请求头
-# X-Task-Token 携带。留空则相关接口一律拒绝执行（fail-closed，防止误暴露）。
+# 内部同步 HTTP 接口的共享令牌（手动/外部触发用），请求头 X-Task-Token 携带。
+# 留空则该 HTTP 接口一律拒绝执行（fail-closed，防止误暴露）。内置定时器不受此约束。
 TASK_TOKEN = os.environ.get('TASK_TOKEN', '')
 # 影片同步任务默认城市（麻花 cityId，成都=8）。可被接口 body 的 city 覆盖。
 SYNC_DEFAULT_CITY = os.environ.get('SYNC_DEFAULT_CITY', '8')
+# 内置定时器（APScheduler，进程内触发，不依赖外部调用）。默认开启；
+# 微信云托管须保证服务「最小副本数 ≥ 1」，否则缩容到 0 时进程不在、定时器不触发。
+ENABLE_SCHEDULER = os.environ.get('ENABLE_SCHEDULER', 'true').lower() == 'true'
+# 每天同步的北京时间时点，逗号分隔 HH:MM。去重用进程内缓存锁（LocMem），建议单副本常驻。
+SYNC_CRON_TIMES = os.environ.get('SYNC_CRON_TIMES', '00:30,13:00')
 
 # 密码校验
 AUTH_PASSWORD_VALIDATORS = [

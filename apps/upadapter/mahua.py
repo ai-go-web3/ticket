@@ -3,7 +3,8 @@
 基于 docs/mahua-api/ 下 32 个接口的正式报文实现，字段映射见 docs/麻花字段级映射.md。
 
 鉴权：所有接口（除登录）通过 header 传 token，MD5 签名 = MD5(bodyJson + key + txntime)。
-token 有效期 2h，需 Redis 缓存 + 定时刷新（严禁每请求都取，否则封 IP）。
+token 有效期 2h，由 apps.upadapter.token 统一缓存（进程内 LocMem）+ 内置定时器每 30min 刷新
+（严禁每请求都取，否则封 IP）。
 """
 import hashlib
 import json
