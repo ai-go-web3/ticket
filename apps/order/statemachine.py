@@ -36,6 +36,7 @@ TRANSITIONS = {
     TicketOrder.STATUS_DISPUTE: {
         TicketOrder.STATUS_WAIT_PICK,     # 纠纷取消恢复
         TicketOrder.STATUS_REFUNDING,     # 纠纷同意退款
+        TicketOrder.STATUS_REFUNDED,      # 麻花已退票回调（ticketRefund）
     },
 }
 
@@ -63,8 +64,9 @@ def transition(order, to_status, force=False):
 
 
 def can_refund(order):
-    """是否可申请退款。"""
-    return order.status in (
-        TicketOrder.STATUS_DISPATCHING,
-        TicketOrder.STATUS_WAIT_PICK,
-    )
+    """是否可申请退款。
+
+    业务规则：任何订单不允许改签；仅「待出票」（出票中，尚未拿到票）订单
+    允许退票（走麻花拦截）。已出票（待取票）及之后状态一律不可退。
+    """
+    return order.status == TicketOrder.STATUS_DISPATCHING

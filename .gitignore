@@ -21,3 +21,8 @@ cloudrun-env.json
 .idea/
 .vscode/
 .DS_Store
+
+# 微信商户API证书（私钥严禁入库）
+certs/
+*.pem
+*.p12

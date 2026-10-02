@@ -7,10 +7,12 @@ from apps.order.models import TicketOrder, Ticket
 class OrderSerializer(serializers.ModelSerializer):
     seats = serializers.SerializerMethodField()
     movieName = serializers.SerializerMethodField()
+    poster = serializers.SerializerMethodField()
     cinemaName = serializers.SerializerMethodField()
     showTime = serializers.SerializerMethodField()
     statusText = serializers.SerializerMethodField()
     statusColor = serializers.SerializerMethodField()
+    payRemainSeconds = serializers.SerializerMethodField()
 
     class Meta:
         model = TicketOrder
@@ -18,7 +20,8 @@ class OrderSerializer(serializers.ModelSerializer):
                   'seats', 'seat_count', 'ticket_amount', 'service_fee',
                   'discount_amount', 'pay_amount', 'settle_amount', 'mobile',
                   'status', 'statusText', 'statusColor', 'pay_status',
-                  'movieName', 'cinemaName', 'showTime', 'created_at']
+                  'payRemainSeconds',
+                  'movieName', 'poster', 'cinemaName', 'showTime', 'created_at']
 
     _STATUS_TEXT = {
         TicketOrder.STATUS_PAYING: '待付款',
@@ -40,10 +43,20 @@ class OrderSerializer(serializers.ModelSerializer):
             return []
         return [s.get('name') or f"{s.get('row')}排{int(s.get('col', 0)) + 1}座" for s in seats]
 
+    def _movie(self, obj):
+        cache = self.context.setdefault('_movie_cache', {})
+        if obj.movie_id not in cache:
+            from apps.catalog.models import Movie
+            cache[obj.movie_id] = Movie.objects.filter(id=obj.movie_id).first()
+        return cache[obj.movie_id]
+
     def get_movieName(self, obj):
-        from apps.catalog.models import Movie
-        m = Movie.objects.filter(id=obj.movie_id).first()
+        m = self._movie(obj)
         return m.name if m else ''
+
+    def get_poster(self, obj):
+        m = self._movie(obj)
+        return (m.poster_url or '') if m else ''
 
     def get_cinemaName(self, obj):
         from apps.catalog.models import Cinema
@@ -68,6 +81,15 @@ class OrderSerializer(serializers.ModelSerializer):
                           TicketOrder.STATUS_DONE):
             return '#ff2f6d'
         return '#8a90a0'
+
+    def get_payRemainSeconds(self, obj):
+        """待付款剩余支付秒数（前端倒计时用）；非待付款状态返回 0。"""
+        if obj.status != TicketOrder.STATUS_PAYING:
+            return 0
+        from django.utils import timezone
+        from apps.order.services import pay_timeout_seconds
+        remain = pay_timeout_seconds() - (timezone.now() - obj.created_at).total_seconds()
+        return max(int(remain), 0)
 
 
 class TicketSerializer(serializers.ModelSerializer):

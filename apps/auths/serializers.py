@@ -7,8 +7,10 @@ from apps.auths.models import AppUser
 class UserSerializer(serializers.ModelSerializer):
     """用户信息（前端契约：驼峰字段）。
 
-    返回 { id, nickname, avatar, phone, phoneMask, city, inviteCode }，
+    返回 { id, nickname, avatar, phoneMask, city, inviteCode }，
     city 为 { cityId(麻花), stdCode(国标), name }，未设置城市时为 null。
+    注意：出于隐私安全，接口**不回传明文手机号**（model.phone 不序列化），
+    仅返回脱敏 phoneMask；完整手机号留在服务端，在下单时由后端补为取票号。
     """
     avatar = serializers.CharField(source='avatar_url', allow_null=True)
     phoneMask = serializers.CharField(source='phone_mask', allow_null=True)
@@ -17,8 +19,8 @@ class UserSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = AppUser
-        fields = ['id', 'nickname', 'avatar', 'phone', 'phoneMask',
-                  'inviteCode', 'city']
+        fields = ['id', 'nickname', 'avatar',
+                  'phoneMask', 'inviteCode', 'city']
 
     def get_inviteCode(self, obj):
         # 用用户 ID 稳定生成推广码（去除易混字符的 32 进制编码，前端展示/分享用）
@@ -49,3 +51,9 @@ class WxLoginSerializer(serializers.Serializer):
 
 class BindPhoneSerializer(serializers.Serializer):
     code = serializers.CharField(max_length=128, help_text='getPhoneNumber code')
+
+
+class UpdateProfileSerializer(serializers.Serializer):
+    """用户主动完善资料：昵称（微信 type=nickname 输入框）/ 头像。"""
+    nickname = serializers.CharField(max_length=64, required=False, allow_blank=True)
+    avatar = serializers.CharField(max_length=512, required=False, allow_blank=True)

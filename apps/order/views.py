@@ -51,7 +51,10 @@ def order_detail(request, order_id):
 
 @api_view(['GET'])
 def my_orders(request):
-    """我的订单列表。支持 tab（四态分组）或 status（单一状态）过滤。"""
+    """我的订单列表。支持 tab（四态分组）或 status（单一状态）过滤。
+
+    待付款已超时的单先惰性关闭再返回（定时器兜底前的即时收敛）。
+    """
     qs = TicketOrder.objects.filter(user_id=request.user_id, deleted=0)
     tab = request.query_params.get('tab')
     status = request.query_params.get('status')
@@ -60,6 +63,9 @@ def my_orders(request):
     elif status:
         qs = qs.filter(status=status)
     qs = qs.order_by('-created_at')
+    for order in qs:
+        if services.close_if_expired(order):
+            order.refresh_from_db()
     return ok(OrderSerializer(qs, many=True).data)
 
 
@@ -75,12 +81,13 @@ def order_count(request):
 
 @api_view(['POST'])
 def cancel_order(request, order_id):
-    """取消订单（未支付 -> 释放座位）。"""
+    """取消订单（待付款 -> 已关闭，释放座位）。"""
     order = services.query_order(order_id, user_id=request.user_id)
     if order.status != TicketOrder.STATUS_PAYING:
         raise BizError('当前状态不可取消')
     from apps.order.statemachine import transition
     transition(order, TicketOrder.STATUS_CLOSED)
+    TicketOrder.objects.filter(id=order.id).update(close_reason='用户主动取消')
     from apps.seat.services import release_lock
     if order.lock_token:
         release_lock(order.lock_token)

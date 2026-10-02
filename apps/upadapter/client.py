@@ -45,7 +45,12 @@ def build_dispatch_payload(order, call_back_url=None):
     """构造放单请求 body（字段映射 §4.1）。
 
     优先用 row+col（seatId 可能变动）。
+    总限价 costTotalPrice：MAHUA_COST_TOTAL_PRICE 环境变量优先（联调防损/成本护栏，
+    实际成本高于该价时麻花拒绝出单）；未设置时若已有结算价快照则用作上限。
+    放单时结算价通常尚未回填，等于默认不限价——生产建议配置环境变量上限。
     """
+    from django.conf import settings as dj_settings
+
     seats = json.loads(order.seats_json or '[]')
     buy_seats = []
     for s in seats:
@@ -68,13 +73,24 @@ def build_dispatch_payload(order, call_back_url=None):
         payload['callBackUrl'] = call_back_url
     if order.mobile:
         payload['phoneNo'] = order.mobile
-    if order.settle_amount:
+
+    cap = (dj_settings.MAHUA.get('COST_TOTAL_PRICE') or '').strip()
+    if cap:
+        try:
+            payload['costTotalPrice'] = float(cap)
+        except ValueError:
+            logger.warning('MAHUA_COST_TOTAL_PRICE 配置非法，忽略: %r', cap)
+    elif order.settle_amount:
         payload['costTotalPrice'] = order.settle_amount / 100.0  # 分 -> 元
     return payload
 
 
 def dispatch(order_ext_no, call_back_url=None):
-    """放单：从麻花余额扣款，代出票（异步）。真实扣款，受资金安全开关控制。
+    """放单：本地生成放单订单（mahua_dispatch）+ 调用麻花 /api/movie-server/movie/put/add。
+
+    调用方必须把本函数包在 transaction.atomic() 内：本地放单订单落库与真实放单
+    调用在同一事务（付款成功链路的要求）。本函数内部吞掉网络异常，绝不向外抛——
+    支付已成功（微信侧已扣款），不能因放单异常回滚支付落库。
 
     返回 (成功标志, 放单号)。放单只拿放单号，出票结果靠回调 + 查询轮询收敛。
 
@@ -82,6 +98,10 @@ def dispatch(order_ext_no, call_back_url=None):
         只构造并落库真实放单报文（dry-run），绝不调用 /put/add，不扣款；
         返回 (False, 'DRY-RUN')，订单停在「出票中」等待真正放单。
     =True 时：真正调用麻花放单接口。
+
+    按 docs/mahua-api/03-放单-22-放单.md 注意事项：
+        - 相同单号勿重复提交（outId 幂等由 update_or_create + 调用方保证）
+        - 提交超时/无法解析报文时，标记 STATUS_PENDING，由补偿任务走查询接口收敛
     """
     from django.conf import settings as dj_settings
 
@@ -107,9 +127,44 @@ def dispatch(order_ext_no, call_back_url=None):
             order_ext_no, json.dumps(payload, ensure_ascii=False))
         return False, 'DRY-RUN'
 
-    token = get_token()
-    code, data = client.dispatch(token, payload)
+    try:
+        token = get_token()
+        code, data = client.dispatch(token, payload)
+    except Exception as exc:  # noqa: BLE001 提交超时/非JSON报文：留待查询接口补偿
+        logger.error('放单请求异常（待补偿） order=%s err=%s', order_ext_no, exc)
+        MahuaDispatch.objects.update_or_create(
+            order_ext_no=order.order_ext_no,
+            defaults={
+                'request_body': payload,
+                'response_body': {'error': str(exc)[:500]},
+                'dispatch_status': MahuaDispatch.STATUS_PENDING,
+            },
+        )
+        return False, ''
+
     mahua_order_no = data if isinstance(data, str) else (data or {}).get('id', '')
+
+    if code != SUCCESS_CODE:
+        # 明确被拒（拿到 rtnCode 但非成功，如超限价/余额不足）：麻花未受理该单，
+        # 之后不会有任何回调。放单订单记失败，我方订单转「出票失败」并自动退款，
+        # 防止永远卡在「出票中」。（超时/异常情形走上面 except 分支，用查询补偿）
+        MahuaDispatch.objects.update_or_create(
+            order_ext_no=order.order_ext_no,
+            defaults={
+                'mahua_order_no': mahua_order_no,
+                'request_body': payload,
+                'response_body': {'rtnCode': code, 'rtnData': data},
+                'dispatch_status': MahuaDispatch.STATUS_FAIL,
+            },
+        )
+        logger.error('放单被麻花拒绝 order=%s code=%s data=%s', order_ext_no, code, data)
+        try:
+            transition(order, TicketOrder.STATUS_DISPATCH_FAIL)
+            from apps.refund.services import auto_refund_dispatch_fail
+            auto_refund_dispatch_fail(order)
+        except Exception as exc:  # noqa: BLE001 收敛失败留待人工/定时器，不影响支付落库
+            logger.error('放单拒绝后的订单收敛异常 order=%s err=%s', order_ext_no, exc)
+        return False, mahua_order_no
 
     MahuaDispatch.objects.update_or_create(
         order_ext_no=order.order_ext_no,
@@ -120,11 +175,6 @@ def dispatch(order_ext_no, call_back_url=None):
             'dispatch_status': MahuaDispatch.STATUS_DISPATCHED,
         },
     )
-
-    if code != SUCCESS_CODE:
-        logger.error('放单失败 order=%s code=%s data=%s', order_ext_no, code, data)
-        return False, mahua_order_no
-
     logger.info('放单成功 order=%s mahua_order_no=%s', order_ext_no, mahua_order_no)
     return True, mahua_order_no
 
@@ -148,6 +198,8 @@ def query_and_sync(order_ext_no):
     if status == QUERY_DRAW_SUCCESS:
         _on_ticketed(order, data)
     elif status == QUERY_CONFIRM:
+        if order.status == TicketOrder.STATUS_DISPATCHING:
+            transition(order, TicketOrder.STATUS_WAIT_PICK)
         if order.status != TicketOrder.STATUS_DONE:
             transition(order, TicketOrder.STATUS_DONE)
     elif status == QUERY_DRAW_CLOSE:
@@ -211,19 +263,21 @@ def on_order_callback(payload):
             from apps.distributor.services import settle_commission
             settle_commission(order)
     elif status == CALLBACK_TICKET_REFUND:
-        # 已退票（关注 ticketRefundFee）
-        if order.status not in (TicketOrder.STATUS_REFUNDED,):
+        # 已退票（关注 ticketRefundFee）：纠纷中/退款中 -> 已退款
+        if order.status in (TicketOrder.STATUS_REFUNDING, TicketOrder.STATUS_DISPUTE):
             transition(order, TicketOrder.STATUS_REFUNDED)
 
-    # 更新放单映射（成交价 + 关闭原因 + 退票手续费）
-    update_fields = {}
-    if payload.get('confirmPrice') is not None:
-        update_fields['mahua_order_no'] = payload.get('outId')
+    # 更新放单映射（关闭原因 + 按回调状态收敛放单状态）
     if payload.get('note'):
         order.close_reason = payload.get('note')
         order.save(update_fields=['close_reason', 'updated_at'])
+    if status in (CALLBACK_DRAW_SUCCESS, CALLBACK_UPDATE, CALLBACK_CONFIRM):
+        new_ds = MahuaDispatch.STATUS_TICKETED
+    elif status == CALLBACK_TICKET_REFUND:
+        new_ds = MahuaDispatch.STATUS_REFUNDED
+    else:
+        new_ds = MahuaDispatch.STATUS_FAIL
     MahuaDispatch.objects.filter(order_ext_no=out_id).update(
-        response_body=payload,
-        dispatch_status=MahuaDispatch.STATUS_TICKETED if status in (CALLBACK_DRAW_SUCCESS, CALLBACK_UPDATE, CALLBACK_CONFIRM) else MahuaDispatch.STATUS_FAIL,
+        response_body=payload, dispatch_status=new_ds,
     )
     return order

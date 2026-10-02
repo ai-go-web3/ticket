@@ -15,7 +15,7 @@ import xml.etree.ElementTree as ET
 import requests
 from django.conf import settings
 
-from apps.common.response import BizError
+from apps.common.response import BizError, ErrorCode
 from apps.order.models import TicketOrder
 
 logger = logging.getLogger('app')
@@ -125,15 +125,24 @@ def mock_pay_success(order_id, user_id=None):
 
 
 def on_pay_callback(request):
-    """支付回调（微信异步通知）。"""
+    """支付回调（微信异步通知）：验签 + 金额校验 + 幂等落库。"""
     from apps.order.services import mark_paid
-    from apps.order.models import OrderPayment
 
-    result = _xml_to_dict(request.body)
+    try:
+        result = _xml_to_dict(request.body)
+    except Exception:  # noqa: BLE001 非 XML 报文：直接拒绝（微信只发合法 XML）
+        return {'return_code': 'FAIL', 'return_msg': 'invalid xml'}
     if result.get('return_code') != 'SUCCESS':
-        return {'return_code': 'FAIL'}
+        return {'return_code': 'FAIL', 'return_msg': 'invalid notify'}
+    if result.get('result_code') != 'SUCCESS':
+        # 支付失败/关单等通知：确认收到即可，不改订单状态
+        return {'return_code': 'SUCCESS'}
 
-    # 验签（骨架阶段略过完整验签，标注 TODO）
+    cfg = settings.WECHAT
+    if cfg.get('PAY_KEY') and not _verify_sign(dict(result), cfg['PAY_KEY']):
+        logger.error('支付回调验签失败 out_trade_no=%s', result.get('out_trade_no'))
+        return {'return_code': 'FAIL', 'return_msg': 'sign error'}
+
     pay_no = result.get('transaction_id')
     order_ext_no = result.get('out_trade_no')
     amount = int(result.get('total_fee', 0))
@@ -141,7 +150,136 @@ def on_pay_callback(request):
     try:
         order = TicketOrder.objects.get(order_ext_no=order_ext_no)
     except TicketOrder.DoesNotExist:
-        return {'return_code': 'FAIL'}
+        logger.error('支付回调订单不存在 out_trade_no=%s', order_ext_no)
+        return {'return_code': 'FAIL', 'return_msg': 'order not found'}
+
+    # 金额校验：回调金额必须与订单应付一致（防篡改/错单）
+    if amount != order.pay_amount:
+        logger.error('支付回调金额不符 order=%s 回调=%s分 应付=%s分',
+                     order_ext_no, amount, order.pay_amount)
+        return {'return_code': 'FAIL', 'return_msg': 'amount mismatch'}
 
     mark_paid(order.id, pay_no, amount, callback_raw=result)
+    return {'return_code': 'SUCCESS'}
+
+
+def _verify_sign(params, key):
+    """微信支付 v2 回调验签：去掉 sign 后按 k=v& 排序拼接 MD5 对比。"""
+    sign = params.pop('sign', '')
+    return bool(sign) and sign == _sign(params, key)
+
+
+# ===== 微信退款（放单失败/回调失败场景的用户回款） =====
+
+REFUND_API = 'https://api.mch.weixin.qq.com/secapi/pay/refund'
+
+
+def wx_refund(order, refund):
+    """发起微信退款（v2 /secapi/pay/refund，双向证书）。
+
+    返回 (受理成功?, 微信退款单号或 None)。
+    - 已配置商户证书（WX_MCH_CERT_PATH/WX_MCH_KEY_PATH）：真实退款，打回真金白银；
+    - 未配置证书：骨架降级（视为受理成功，不真打款），联调环境无证书也能跑通状态链路。
+    退款被微信拒绝时抛 BizError，由调用方决定回滚/重试（订单停在「退款中」待补偿）。
+    """
+    cfg = settings.WECHAT
+    if not (cfg.get('MCHID') and cfg.get('PAY_KEY')):
+        logger.warning('微信支付未配置，退款降级为骨架标记 refund=%s', refund.refund_ext_no)
+        return True, None
+    cert, key = cfg.get('MCH_CERT_PATH') or '', cfg.get('MCH_KEY_PATH') or ''
+    real_refund = bool(cert and key)
+    if not real_refund:
+        logger.warning('商户API证书未配置，退款降级为骨架标记 refund=%s', refund.refund_ext_no)
+
+    if refund.refund_amount <= 0:
+        raise BizError('退款金额非法')
+
+    params = {
+        'appid': cfg['APPID'],
+        'mch_id': cfg['MCHID'],
+        'nonce_str': uuid.uuid4().hex,
+        'out_refund_no': refund.refund_ext_no,
+        'out_trade_no': order.order_ext_no,
+        'total_fee': int(order.pay_amount),
+        'refund_fee': int(refund.refund_amount),
+        'op_user_id': cfg['MCHID'],
+    }
+    # 退款结果通知地址：未显式配置时从支付回调地址推导（/pay/callback -> /pay/refund-notify）
+    notify_url = cfg.get('REFUND_NOTIFY_URL') or (cfg.get('NOTIFY_URL') or '').replace(
+        '/pay/callback', '/pay/refund-notify')
+    if notify_url:
+        params['notify_url'] = notify_url
+    params['sign'] = _sign(params, cfg['PAY_KEY'])
+
+    resp = requests.post(
+        REFUND_API, data=_dict_to_xml(params).encode(),
+        cert=(cert, key) if real_refund else None, timeout=15,
+    )
+    result = _xml_to_dict(resp.text)
+    if result.get('return_code') != 'SUCCESS':
+        logger.error('微信退款请求失败 refund=%s result=%s', refund.refund_ext_no, result)
+        raise BizError(f"微信退款失败: {result.get('return_msg') or '通信异常'}")
+    if result.get('result_code') != 'SUCCESS':
+        logger.error('微信退款被拒 refund=%s err_code=%s des=%s',
+                     refund.refund_ext_no, result.get('err_code'), result.get('err_code_des'))
+        raise BizError(f"微信退款失败: {result.get('err_code_des') or result.get('err_code')}")
+
+    wx_refund_no = result.get('refund_id') or ''
+    logger.info('微信退款已受理 refund=%s wx_refund_no=%s 金额=%s分',
+                refund.refund_ext_no, wx_refund_no, refund.refund_amount)
+    return True, wx_refund_no
+
+
+def _decrypt_req_info(req_info_b64, pay_key):
+    """解密退款通知 req_info：base64 -> AES-256-ECB(key=md5(pay_key)) -> PKCS7 去填充。"""
+    import base64
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    key = hashlib.md5(pay_key.encode()).hexdigest().lower().encode()
+    data = base64.b64decode(req_info_b64)
+    dec = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
+    padded = dec.update(data) + dec.finalize()
+    return padded[:-padded[-1]]  # PKCS7 去填充
+
+
+def on_refund_notify(request):
+    """退款结果通知（微信异步推送）：解密 req_info，回写退款单状态。
+
+    refund_status: SUCCESS/CHANGE(退款异常退回用户卡) -> 到账；FAIL/REFUNDCLOSE -> 失败。
+    返回 {'return_code': ...} 供视图层应答微信。
+    """
+    from apps.refund.models import Refund
+
+    result = _xml_to_dict(request.body)
+    if result.get('return_code') != 'SUCCESS' or not result.get('req_info'):
+        return {'return_code': 'FAIL', 'return_msg': 'invalid notify'}
+
+    pay_key = settings.WECHAT.get('PAY_KEY') or ''
+    if not pay_key:
+        return {'return_code': 'FAIL', 'return_msg': 'pay key missing'}
+    try:
+        plain = _decrypt_req_info(result['req_info'], pay_key)
+        info = _xml_to_dict(plain.decode('utf-8'))
+    except Exception as exc:  # noqa: BLE001 解密失败多为密钥不匹配
+        logger.error('退款通知解密失败 err=%s', exc)
+        return {'return_code': 'FAIL', 'return_msg': 'decrypt error'}
+
+    out_refund_no = info.get('out_refund_no') or ''
+    refund_status = info.get('refund_status') or ''
+    refund = Refund.objects.filter(refund_ext_no=out_refund_no).first()
+    if not refund:
+        logger.error('退款通知找不到退款单 out_refund_no=%s', out_refund_no)
+        return {'return_code': 'SUCCESS'}  # 无法归属，确认止血靠日志排查
+
+    if refund_status in ('SUCCESS', 'CHANGE'):
+        refund.status = Refund.STATUS_ARRIVED
+    elif refund_status in ('FAIL', 'REFUNDCLOSE'):
+        refund.status = Refund.STATUS_FAIL
+        logger.error('微信退款未到账 refund=%s status=%s', out_refund_no, refund_status)
+    else:
+        logger.warning('退款通知未知状态 refund=%s status=%s', out_refund_no, refund_status)
+        return {'return_code': 'SUCCESS'}
+
+    refund.save(update_fields=['status', 'updated_at'])
+    logger.info('退款通知已处理 refund=%s status=%s', out_refund_no, refund_status)
     return {'return_code': 'SUCCESS'}

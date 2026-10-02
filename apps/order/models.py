@@ -60,6 +60,7 @@ class MahuaDispatch(models.Model):
     STATUS_FAIL = 3         # 出票失败
     STATUS_INTERCEPTED = 4  # 已拦截
     STATUS_REFUNDED = 5     # 已退款
+    STATUS_PENDING = 6      # 待放单/待补偿（提交超时或返回异常，用查询接口补偿）
 
     order_ext_no = models.CharField(max_length=64, unique=True, verbose_name='订单号')
     mahua_order_no = models.CharField(max_length=64, null=True, verbose_name='麻花放单号')

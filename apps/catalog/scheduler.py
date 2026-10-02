@@ -62,6 +62,14 @@ def _run_token_job():
         logger.error('内置麻花 token 刷新任务失败（无可用 token）')
 
 
+def _run_close_expired_job():
+    """APScheduler 回调：关闭超时未付款订单。"""
+    from apps.order.services import close_expired_orders
+    closed = close_expired_orders()
+    if closed:
+        logger.info('超时未付款订单自动关闭：%s 单', closed)
+
+
 def _token_refresh_minutes():
     """从 settings.MAHUA['TOKEN_REFRESH']（秒）取刷新间隔分钟，<=0 表示不启用。"""
     try:
@@ -108,6 +116,14 @@ def start():
         added += 1
     elif refresh_min > 0 and not mahua_configured:
         logger.warning('麻花 BASE_URL 未配置，跳过 token 刷新定时器')
+
+    # 超时未付款订单自动关闭：每分钟扫一批（详情查询另有惰性关单兜底）
+    sched.add_job(
+        _run_close_expired_job, IntervalTrigger(seconds=60),
+        id='order_close_expired', name='order_close_expired',
+        replace_existing=True, coalesce=True, misfire_grace_time=300,
+    )
+    added += 1
 
     if added == 0:
         logger.warning('无任何定时任务需要注册，调度器未启动')

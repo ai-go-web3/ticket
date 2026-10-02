@@ -133,6 +133,14 @@ WECHAT = {
     'MCH_CERT_SERIAL': os.environ.get('WX_MCH_CERT_SERIAL', ''),
     'MCH_PRIVATE_KEY': os.environ.get('WX_MCH_PRIVATE_KEY', ''),
     'NOTIFY_URL': os.environ.get('WX_NOTIFY_URL', ''),    # 支付回调地址
+    # 微信退款（v2 /secapi/pay/refund 需商户 API 证书做双向 TLS）：
+    # apiclient_cert.pem / apiclient_key.pem 两个 PEM 文件路径（从商户平台下载的
+    # 证书包解出，或用 openssl 从 apiclient_cert.p12 导出）。
+    # 两者任一缺失 -> 退款降级为骨架标记（不真打款，联调环境用）。
+    'MCH_CERT_PATH': os.environ.get('WX_MCH_CERT_PATH', ''),
+    'MCH_KEY_PATH': os.environ.get('WX_MCH_KEY_PATH', ''),
+    # 退款结果通知地址（微信异步推送退款到账结果，AES 加密）
+    'REFUND_NOTIFY_URL': os.environ.get('WX_REFUND_NOTIFY_URL', ''),
 }
 
 # 麻花电影（UP）配置
@@ -148,11 +156,20 @@ MAHUA = {
     'DISPATCH_ENABLED': os.environ.get('MAHUA_DISPATCH_ENABLED', 'false').lower() == 'true',
     # 麻花放单回调地址（必须 http 开头，公网可达）。本地开发收不到回调，靠查询轮询收敛。
     'CALLBACK_URL': os.environ.get('MAHUA_CALLBACK_URL', ''),
+    # 放单总限价（元，costTotalPrice 字段）：实际出票成本高于该价时麻花拒绝出单。
+    # 联调防损：设 0.01 可保证真实放单永远不成功（订单走「出票失败 -> 自动退款」，
+    # 麻花余额零扣款）。留空 = 不传该字段；生产建议按业务设一个合理成本上限。
+    'COST_TOTAL_PRICE': os.environ.get('MAHUA_COST_TOTAL_PRICE', ''),
 }
 
 # 订单/锁座时长（秒）
 SEAT_LOCK_TTL = int(os.environ.get('SEAT_LOCK_TTL', '600'))    # 锁座 10 分钟
 PAY_TIMEOUT = int(os.environ.get('PAY_TIMEOUT', '900'))        # 支付 15 分钟
+
+# 真实支付联调开关：强制所有订单实付金额（分）。
+# 设 PAY_AMOUNT_OVERRIDE_FEN=1 即 0.01 元走真实微信支付/放单全链路，避免联调期
+# 按票面价真金白银扣款。留空/0 = 按正常票价计费（生产必须留空或 0）。
+PAY_AMOUNT_OVERRIDE_FEN = int(os.environ.get('PAY_AMOUNT_OVERRIDE_FEN', '0') or 0)
 
 # JWT
 JWT_EXPIRE_SECONDS = int(os.environ.get('JWT_EXPIRE_SECONDS', '7200'))

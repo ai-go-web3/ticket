@@ -8,7 +8,7 @@ from rest_framework.permissions import AllowAny
 
 from apps.auths.models import AppUser
 from apps.auths.authentication import gen_token
-from apps.auths.serializers import WxLoginSerializer, BindPhoneSerializer, UserSerializer
+from apps.auths.serializers import WxLoginSerializer, BindPhoneSerializer, UserSerializer, UpdateProfileSerializer
 from apps.auths.wechat import code2session, get_phone
 from apps.common.response import ok, BizError, ErrorCode
 
@@ -60,7 +60,9 @@ def bind_phone(request):
     try:
         phone_info = get_phone(code)
     except ValueError as e:
-        raise BizError(str(e), code=40100)
+        # 手机号换取失败(如 code 被复用微信返 40163 / 本地未配 WX_APPID 走 dev-fallback)
+        # 属业务失败，用专用码，勿用 40100，否则前端会误判「登录过期」而清 token + 静默重登
+        raise BizError(str(e) or '手机号绑定失败，请重试', code=ErrorCode.PHONE_BIND_FAILED)
     except requests.RequestException as e:
         logger.error('get_phone 网络异常: %s', e)
         raise BizError('微信接口暂时不可达，请稍后重试', code=ErrorCode.UP_ERROR)
@@ -79,3 +81,24 @@ def bind_phone(request):
 def profile(request):
     """当前用户信息。"""
     return ok(UserSerializer(request.user).data)
+
+
+@api_view(['POST'])
+def update_profile(request):
+    """用户主动完善资料：保存昵称（微信 type=nickname 输入框）/ 头像。仅更新非空字段。"""
+    ser = UpdateProfileSerializer(data=request.data)
+    ser.is_valid(raise_exception=True)
+    user = request.user
+    data = ser.validated_data
+    fields = []
+    nickname = (data.get('nickname') or '').strip()
+    avatar = (data.get('avatar') or '').strip()
+    if nickname:
+        user.nickname = nickname[:64]
+        fields.append('nickname')
+    if avatar:
+        user.avatar_url = avatar[:512]
+        fields.append('avatar_url')
+    if fields:
+        user.save(update_fields=fields)
+    return ok(UserSerializer(user).data)

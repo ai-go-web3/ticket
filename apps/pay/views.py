@@ -47,3 +47,15 @@ def pay_callback(request):
         f"<xml><return_code><![CDATA[{result['return_code']}]]></return_code></xml>",
         content_type='application/xml',
     )
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+@authentication_classes([])
+def refund_notify(request):
+    """微信退款结果通知（无需鉴权，req_info AES 加密由服务层解密）。"""
+    result = services.on_refund_notify(request)
+    return HttpResponse(
+        f"<xml><return_code><![CDATA[{result['return_code']}]]></return_code></xml>",
+        content_type='application/xml',
+    )
