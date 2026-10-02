@@ -29,13 +29,22 @@ def cities(request):
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def movies(request):
-    """影片列表。status: 1热映 2待映；可选 city_code。"""
+    """影片列表。status: 1热映 2待映。
+
+    热映支持 cityCode（前端当前城市，麻花 cityId 或国标码）：实时拉麻花
+    movieOnInfoList(ci=城市id)，读写穿透本地库并缓存 1 小时；城市解析失败
+    回退 SYNC_DEFAULT_CITY。待映为全国列表（麻花 comingList 无城市维度），
+    按需最多拉 30 条、缓存 12 小时。两类均走本地库返回，麻花失败降级旧数据。
+    """
     status = request.query_params.get('status', '1')
-    qs = Movie.objects.filter(deleted=0, status=status)
     if status == '1':
-        qs = qs.order_by('-release_date')
+        city_code = request.query_params.get('cityCode')
+        mahua_city = catalog_services.resolve_city_code(city_code) if city_code else None
+        if not mahua_city:
+            mahua_city = str(getattr(settings, 'SYNC_DEFAULT_CITY', '8'))
+        qs = catalog_services.pull_movies(mahua_city, status='hot')
     else:
-        qs = qs.order_by('release_date')
+        qs = catalog_services.pull_movies(status='coming')
     return ok(MovieSerializer(qs, many=True).data)
 
 
@@ -64,7 +73,8 @@ def _haversine(lng1, lat1, lng2, lat2):
 def cinemas(request):
     """影院列表。支持：城市/影片/区域/关键词/日期筛选，按距离或最低价排序。
 
-    query: cityCode, movieId, area, kw, date(YYYY-MM-DD), lng, lat, orderBy(distance|price)
+    query: cityCode, movieId, area, kw, date(YYYY-MM-DD), lng, lat, orderBy(distance|price),
+           limit（返回条数上限，默认 30，最大 100——列表页看不了太多，减少传输量）
     返回按距离升序排列，distance 为米（未传经纬度时为 null）。
     注意：按影片(movieId)查询时，麻花 cinemaList 必须同时带 filmId+date 才会真正按影片过滤，
     否则退化为整城影院（含未排片）；故此处对影片查询默认补 date=今天。
@@ -75,6 +85,10 @@ def cinemas(request):
     kw = request.query_params.get('kw')
     date = request.query_params.get('date')  # YYYY-MM-DD
     order_by = request.query_params.get('orderBy') or 'distance'
+    try:
+        limit = min(max(int(request.query_params.get('limit', 30)), 1), 100)
+    except (TypeError, ValueError):
+        limit = 30
     try:
         lng = float(request.query_params.get('lng'))
         lat = float(request.query_params.get('lat'))
@@ -137,7 +151,7 @@ def cinemas(request):
         if order_by == 'distance':
             cinemas.sort(key=lambda c: (c._distance is None, c._distance or 0))
 
-    return ok(CinemaSerializer(cinemas, many=True).data)
+    return ok(CinemaSerializer(cinemas[:limit], many=True).data)
 
 
 @api_view(['GET'])
@@ -149,7 +163,10 @@ def cinema_areas(request):
     query: cityCode（必填）、date（YYYY-MM-DD，不传默认今天）、movieId（可选，
            传则收敛为「有该片排片的区」，用于影片搜索/详情场景）。
     返回：[{name, count}]，count 为该区影院数，按数量降序。
-    麻花异常时回退本地 Cinema 表统计，保证下拉不空。
+    口径：按影片筛选（movieId 能解析出有效 up_movie_id）时，以麻花结果为权威——
+    麻花返回空即「该影片在本城当日无排片」，直接返回空列表（与 cinemas 接口一致），
+    不再回退成整城区域误导上层。仅在「未按影片筛选」且麻花异常/返回空时，
+    才回退本地 Cinema 表统计，保证「全城▾」下拉不空。
     """
     city_code = request.query_params.get('cityCode')
     date = request.query_params.get('date') or timezone.now().date().isoformat()
@@ -168,11 +185,15 @@ def cinema_areas(request):
             )
             if regions:
                 return ok(regions)
+            # 按影片筛选时，麻花返回空 = 该片在本城确无排片，空集即权威结果，
+            # 直接返回空列表（与 cinemas 口径一致），不回退成整城区域误导上层。
+            if up_movie_id:
+                return ok([])
         except Exception as exc:  # noqa: BLE001
             import logging
             logging.getLogger('app').warning('实时拉区域失败，回退库数据: %s', exc)
 
-    # 回退：本地 Cinema 表按 region 统计
+    # 回退（仅未按影片筛选、或麻花异常时）：本地 Cinema 表按 region 统计，保证「全城▾」不空
     qs = Cinema.objects.filter(deleted=0, business_status__in=[1, 3])
     if city_code:
         qs = qs.filter(city_code=city_code)

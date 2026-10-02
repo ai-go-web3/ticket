@@ -71,9 +71,21 @@ def bind_phone(request):
     mask = phone[:3] + '****' + phone[-4:]
 
     user = request.user
-    user.phone = phone
-    user.phone_mask = mask
-    user.save(update_fields=['phone', 'phone_mask'])
+    # 手机号唯一性（openid 天然唯一，这里保证一个手机号只归属一条用户）：
+    # 若该手机号已被「另一条」用户绑定，友好拒绝，而不是撞唯一键冒 500。
+    # 同一用户重复绑自己的手机号放行（exclude 掉自己）。
+    if AppUser.objects.filter(phone=phone).exclude(id=user.id).exists():
+        raise BizError('该手机号已绑定其他账号，如有疑问请联系客服', code=ErrorCode.PHONE_BIND_FAILED)
+
+    from django.db import transaction, IntegrityError
+    try:
+        with transaction.atomic():
+            user.phone = phone
+            user.phone_mask = mask
+            user.save(update_fields=['phone', 'phone_mask'])
+    except IntegrityError:
+        # 并发下的兜底：预检通过后仍有另一请求抢先绑定了同一手机号
+        raise BizError('该手机号已绑定其他账号，如有疑问请联系客服', code=ErrorCode.PHONE_BIND_FAILED)
     return ok({'phoneMask': mask})
 
 

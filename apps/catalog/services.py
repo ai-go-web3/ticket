@@ -1,7 +1,7 @@
-"""catalog 数据同步服务：麻花回调增量入库（电影 / 排片 / 城市）。"""
+"""catalog 数据同步服务：麻花回调增量入库（电影 / 排片 / 城市）+ 影片按需拉取。"""
 import io
 import logging
-from datetime import timedelta
+from datetime import date, datetime, timedelta
 
 from django.conf import settings
 from django.core.cache import cache
@@ -355,6 +355,210 @@ def pull_regions(mahua_city_id, date=None, up_movie_id=None, ttl=300):
         except Exception:  # noqa: BLE001
             pass
     return regions
+
+
+# ---------------------------------------------------------------------------
+# 影片按需拉取（读写穿透）：热映 movieOnInfoList(ci=城市)，待映 comingList(全国分页)。
+# 缓存 TTL 内直接读本地库；麻花失败降级返回本地已有数据。替代原每日定时同步。
+# ---------------------------------------------------------------------------
+
+MOVIES_CACHE_TTL = 3600     # 热映列表缓存 1 小时
+COMING_CACHE_TTL = 43200    # 待映列表缓存 12 小时
+COMING_LIST_MAX_ITEMS = 30  # 列表接口按需拉取待映条数上限（comingList 每页 10 条）
+COMING_PULL_MAX_ITEMS = 100  # 定时全量拉取待映条数上限
+
+
+def unwrap_mahua_list(code, data):
+    """麻花 (rtnCode, rtnData) → 影片数组；异常返回空列表。"""
+    if code != '000000' or not data:
+        return []
+    if isinstance(data, str):
+        import json
+        data = json.loads(data)
+    return data if isinstance(data, list) else []
+
+
+def _parse_release(value):
+    """麻花 publishTime '2026-10-01 00:00:00' → date，失败 None。"""
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value)[:10], '%Y-%m-%d').date()
+    except (ValueError, TypeError):
+        return None
+
+
+def upsert_movies(items, status):
+    """麻花影片数组 → movie 表 upsert（热映/待映共用），返回 (created, updated)。
+
+    待映入库跳过已上映（release_date < 今天）的影片：麻花 comingList 会短暂
+    混入刚上映的片子，热映列表（movieOnInfoList）才是在映权威，跳过可避免
+    把已转热映的影片改回待映。
+    """
+    today = date.today()
+    created = updated = skipped = 0
+    for item in items:
+        mid = str(item.get('id', ''))
+        if not mid:
+            continue
+        grade = item.get('grade')
+        release = _parse_release(item.get('publishTime'))
+        if status == Movie.STATUS_COMING and release and release < today:
+            skipped += 1
+            continue
+        wish = item.get('wishNum')
+        defaults = {
+            'name': item.get('name', ''),
+            'status': status,
+            'type': item.get('filmTypes'),
+            'duration': item.get('duration'),
+            'rating': grade if grade not in (None, '') else None,
+            'director': item.get('director') or None,
+            'actors': item.get('cast') or None,
+            'language': item.get('language') or None,
+            'poster_url': item.get('pic') or None,
+            'description': item.get('intro') or None,
+            'release_date': release,
+            'want_count': int(wish) if wish not in (None, '') else 0,
+            'presale': 1 if (release and release > today) else 0,
+            'deleted': 0,
+        }
+        _, is_new = Movie.objects.update_or_create(up_movie_id=mid, defaults=defaults)
+        if is_new:
+            created += 1
+        else:
+            updated += 1
+    if skipped:
+        logger.info('影片入库跳过已上映待映 %s 部', skipped)
+    return created, updated
+
+
+def cleanup_stale_coming():
+    """把已上映（release_date < 今天）却仍标待映的影片置为已下线，统一待映口径。
+
+    麻花把影片移出 comingList 有延迟，仅靠入库跳过清不掉历史数据，这里兜底。
+    返回清理数量。
+    """
+    today = date.today()
+    n = Movie.objects.filter(
+        deleted=0, status=Movie.STATUS_COMING, release_date__lt=today,
+    ).update(status=Movie.STATUS_OFFLINE)
+    if n:
+        logger.info('清理已上映仍标待映影片 %s 部 → 已下线', n)
+    return n
+
+
+def _movies_queryset(status):
+    """影片列表查询集（已按展示规则排序）。热映：想看倒序+上映日期正序；待映：上映日期正序。"""
+    if status == 'hot':
+        return (Movie.objects.filter(deleted=0, status=Movie.STATUS_HOT)
+                .order_by('-want_count', 'release_date'))
+    return (Movie.objects.filter(deleted=0, status=Movie.STATUS_COMING)
+            .order_by('release_date'))
+
+
+def pull_movies(mahua_city_id=None, status='hot', ttl=None, max_items=None):
+    """按需拉影片：读写穿透 + TTL 缓存 + 失败降级，返回本地 Movie 查询集。
+
+    - 热映：movieOnInfoList(ci=麻花城市id)，城市维度数据，mahua_city_id 必传
+      （视图层用 resolve_city_code 归一，解析不出时回退 SYNC_DEFAULT_CITY）。
+      缓存 1 小时。
+    - 待映：comingList(pageNum)，麻花该接口无城市维度，全国列表；按需最多拉
+      max_items（默认 30）条，缓存 12 小时。
+    - 流程：缓存未命中 → 实时调麻花 → upsert 本地 → 写缓存标记 → 查本地返回；
+      TTL 内直接查本地；麻花失败/超时降级返回本地旧数据（不抛错，保证可用性）。
+    """
+    if status == 'hot':
+        ttl = ttl or MOVIES_CACHE_TTL
+    else:
+        ttl = ttl or COMING_CACHE_TTL
+        max_items = max_items or COMING_LIST_MAX_ITEMS
+    tag = 'national' if status == 'coming' else str(mahua_city_id)
+    key = 'mahua:movies:%s:%s' % (tag, status)
+    try:
+        if cache.get(key) is not None:
+            return _movies_queryset(status)
+    except Exception:  # noqa: BLE001 - 缓存不可用时降级直连
+        pass
+
+    try:
+        client, token = _mahua()
+        if status == 'hot':
+            code, data = client.get_hot_movies(token, mahua_city_id)
+            items = unwrap_mahua_list(code, data)
+            created, updated = upsert_movies(items, Movie.STATUS_HOT)
+            logger.info('实时拉热映 city=%s 命中 %s（新增 %s 更新 %s）',
+                        mahua_city_id, len(items), created, updated)
+        else:
+            created = updated = pulled = 0
+            # comingList 每页 10 条：翻页拉到条数上限或拉空为止（循环上限兜底防死循环）
+            for p in range(1, max_items + 1):
+                code, data = client.get_coming_movies(token, p)
+                items = unwrap_mahua_list(code, data)
+                if not items:
+                    break
+                c, u = upsert_movies(items, Movie.STATUS_COMING)
+                created += c
+                updated += u
+                pulled += len(items)
+                if pulled >= max_items:
+                    break
+            logger.info('实时拉待映 上限%s条（新增 %s 更新 %s）', max_items, created, updated)
+        try:
+            cache.set(key, 1, ttl)
+        except Exception:  # noqa: BLE001
+            pass
+        if status == 'coming':
+            cleanup_stale_coming()
+    except Exception as exc:  # noqa: BLE001 - 麻花失败：降级返回本地旧数据
+        logger.error('按需拉影片失败 status=%s city=%s：%s（降级返回本地数据）',
+                     status, tag, exc)
+
+    return _movies_queryset(status)
+
+
+def run_coming_pull(max_items=COMING_PULL_MAX_ITEMS):
+    """全量拉取待映影片（供定时任务/运维手动触发）。
+
+    comingList 为全国分页数据（每页 10 条、无城市维度），循环翻页直到拉空
+    或达到条数上限 max_items（默认 100）；入库复用 upsert_movies（按
+    up_movie_id 增量更新）。成功结束后写入待映列表缓存标记（12 小时），
+    期间 /catalog/movies?status=2 直接查本地。
+
+    返回：{items, created, updated, stopped_by}；stopped_by='empty' 拉空结束 /
+    'cap' 达到条数上限 / 'error' 中途异常。
+    """
+    created = updated = pulled = 0
+    stopped_by = 'cap'
+    try:
+        client, token = _mahua()
+        # 循环上限用 max_items 兜底（每页至少 1 条），防接口异常时死循环
+        for p in range(1, max_items + 1):
+            code, data = client.get_coming_movies(token, p)
+            items = unwrap_mahua_list(code, data)
+            if not items:
+                stopped_by = 'empty'
+                break
+            c, u = upsert_movies(items, Movie.STATUS_COMING)
+            created += c
+            updated += u
+            pulled += len(items)
+            if pulled >= max_items:
+                break
+    except Exception as exc:  # noqa: BLE001 - 中途失败保留已拉数据，下次定时再补
+        logger.error('待映全量拉取中断 page=%s：%s', pulled // 10 + 1, exc)
+        return {'items': pulled, 'created': created, 'updated': updated, 'stopped_by': 'error'}
+
+    if stopped_by == 'empty':
+        try:
+            cache.set('mahua:movies:national:coming', 1, COMING_CACHE_TTL)
+        except Exception:  # noqa: BLE001
+            pass
+    if stopped_by != 'error':
+        cleanup_stale_coming()
+    logger.info('待映全量拉取完成：items=%s created=%s updated=%s stopped_by=%s',
+                pulled, created, updated, stopped_by)
+    return {'items': pulled, 'created': created, 'updated': updated, 'stopped_by': stopped_by}
 
 
 def pull_schedules(mahua_cinema_id, up_movie_id=None):

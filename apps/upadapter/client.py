@@ -31,6 +31,15 @@ QUERY_DISPUTE = 'dispute'
 QUERY_TICKET_REFUND = 'ticketRefund'
 
 
+def _log_payload(payload):
+    """放单入参日志副本：脱敏 phoneNo（日志文件不加密，避免明文手机号落盘）。"""
+    p = dict(payload or {})
+    pn = str(p.get('phoneNo') or '')
+    if pn:
+        p['phoneNo'] = pn[:3] + '****' + pn[-4:] if len(pn) >= 7 else '****'
+    return p
+
+
 def _extract_row_col(seat_name):
     """从座位名提取 (row, col)，如 "4排2座" -> ('4', '2')。
     兼容 "A排5行" 等特殊格式：正则取所有字母数字段，第1个=排，第2个=座。
@@ -123,12 +132,15 @@ def dispatch(order_ext_no, call_back_url=None):
             },
         )
         logger.warning(
-            '[DRY-RUN] 放单未执行（DISPATCH_ENABLED=false）order=%s 报文=%s',
-            order_ext_no, json.dumps(payload, ensure_ascii=False))
+            '[DRY-RUN] 放单未执行（DISPATCH_ENABLED=false）order=%s 入参=%s',
+            order_ext_no, json.dumps(_log_payload(payload), ensure_ascii=False))
         return False, 'DRY-RUN'
 
     try:
         token = get_token()
+        logger.info(
+            '[放单请求] order=%s 入参=%s',
+            order_ext_no, json.dumps(_log_payload(payload), ensure_ascii=False))
         code, data = client.dispatch(token, payload)
     except Exception as exc:  # noqa: BLE001 提交超时/非JSON报文：留待查询接口补偿
         logger.error('放单请求异常（待补偿） order=%s err=%s', order_ext_no, exc)
@@ -141,6 +153,11 @@ def dispatch(order_ext_no, call_back_url=None):
             },
         )
         return False, ''
+
+    logger.info(
+        '[放单响应] order=%s 出参=rtnCode=%s rtnData=%s',
+        order_ext_no, code,
+        data if isinstance(data, str) else json.dumps(data, ensure_ascii=False))
 
     mahua_order_no = data if isinstance(data, str) else (data or {}).get('id', '')
 

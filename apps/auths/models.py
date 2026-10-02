@@ -6,7 +6,7 @@ class AppUser(models.Model):
     """用户（微信小程序）。"""
     openid = models.CharField(max_length=64, unique=True, verbose_name='微信 openid')
     unionid = models.CharField(max_length=64, null=True, verbose_name='unionid')
-    phone = models.CharField(max_length=20, null=True, verbose_name='绑定手机号(加密)')
+    phone = models.CharField(max_length=20, null=True, unique=True, verbose_name='绑定手机号(唯一)')
     phone_mask = models.CharField(max_length=20, null=True, verbose_name='脱敏手机号')
     nickname = models.CharField(max_length=64, null=True, verbose_name='昵称')
     avatar_url = models.CharField(max_length=255, null=True, verbose_name='头像')

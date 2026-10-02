@@ -45,18 +45,24 @@ def code2session(code):
     """wx.login code 换 openid/session_key。
 
     正式环境：调微信 jscode2session。
-    开发降级：未配置 APPID/SECRET 时，用 `dev_<code>` 模拟 openid，便于本地联调。
+    本地联调：未配置 APPID/SECRET 且 DEBUG=true 时，用 `dev_<code>` 模拟 openid。
+    生产环境：未配置凭证一律拒绝登录——假 openid 每次不同会重复新建用户、孤儿化历史订单。
     """
     appid = settings.WECHAT.get('APPID', '')
     secret = settings.WECHAT.get('SECRET', '')
 
     if not appid or not secret:
-        logger.warning('WX_APPID/WX_SECRET 未配置，走开发降级（模拟 openid）')
-        return {
-            'openid': f'dev_{code}',
-            'session_key': 'dev_session_key',
-            'unionid': None,
-        }
+        # 假 openid（dev_<code>）会导致「每次登录都新建一条用户、历史订单被孤儿化」，
+        # 因此只允许在本地 DEBUG 下用于联调；生产一律拒绝，宁可不登录也不造脏数据。
+        if settings.DEBUG:
+            logger.warning('WX_APPID/WX_SECRET 未配置，DEBUG 模式走模拟 openid（严禁用于生产）')
+            return {
+                'openid': f'dev_{code}',
+                'session_key': 'dev_session_key',
+                'unionid': None,
+            }
+        logger.error('WX_APPID/WX_SECRET 未配置且非 DEBUG，拒绝登录（不再以临时 openid 创建用户）')
+        raise ValueError('服务端未配置微信 APPID/SECRET，暂时无法登录')
 
     url_path = '/sns/jscode2session'
     resp = _wx_api('GET', url_path, params={

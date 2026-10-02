@@ -184,7 +184,11 @@ SYNC_DEFAULT_CITY = os.environ.get('SYNC_DEFAULT_CITY', '8')
 # 微信云托管须保证服务「最小副本数 ≥ 1」，否则缩容到 0 时进程不在、定时器不触发。
 ENABLE_SCHEDULER = os.environ.get('ENABLE_SCHEDULER', 'true').lower() == 'true'
 # 每天同步的北京时间时点，逗号分隔 HH:MM。去重用进程内缓存锁（LocMem），建议单副本常驻。
+# 注意：影片已改为按需实时拉取（pull_movies），此配置仅遗留，定时器不再使用。
 SYNC_CRON_TIMES = os.environ.get('SYNC_CRON_TIMES', '00:30,13:00')
+# 待映全量拉取定时任务间隔（分钟，默认 720 = 12 小时）。comingList 为全国分页数据，
+# 定时拉取上限 100 条、循环拉到拉空为止；列表接口另有 12 小时缓存。
+COMING_PULL_MINUTES = int(os.environ.get('COMING_PULL_MINUTES', '720'))
 
 # 密码校验
 AUTH_PASSWORD_VALIDATORS = [
