@@ -228,7 +228,13 @@ def cinema_areas(request):
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def schedules(request):
-    """排期列表。按影院+影片+日期。"""
+    """排期列表（聚合响应）。按影院+影片+日期。
+
+    响应为 {cinema, movies, schedules}：影院详情页一次请求即可渲染整页
+    （影院卡 + 影片海报条 + 场次列表），不再补拉 movies/cinemas 两个接口。
+    影片/影院信息取自本地库（同步入库数据），join 零成本、不多打麻花；
+    movies 仅含本场次有排片的影片（热映+待映，覆盖点映/预售场）。
+    """
     cinema_id = request.query_params.get('cinemaId')
     movie_id = request.query_params.get('movieId')
     date = request.query_params.get('date')  # YYYY-MM-DD
@@ -238,8 +244,9 @@ def schedules(request):
     if movie_id:
         mv = Movie.objects.filter(id=movie_id).first()
         up_movie_id = mv.up_movie_id if mv else None
+    cinema = None
     if cinema_id:
-        cinema = Cinema.objects.filter(id=cinema_id).first()
+        cinema = Cinema.objects.filter(id=cinema_id, deleted=0).first()
         if cinema:
             try:
                 catalog_services.pull_schedules(cinema.up_cinema_id, up_movie_id=up_movie_id)
@@ -259,7 +266,15 @@ def schedules(request):
         qs = qs.filter(start_at__date=date)
     qs = qs.order_by('start_at')
 
-    return ok(ScheduleSerializer(qs, many=True).data)
+    rows = ScheduleSerializer(qs, many=True).data
+    movies = MovieSerializer(
+        Movie.objects.filter(id__in={r['movie_id'] for r in rows}, deleted=0), many=True,
+    ).data
+    return ok({
+        'cinema': CinemaSerializer(cinema).data if cinema else None,
+        'movies': movies,
+        'schedules': rows,
+    })
 
 
 @api_view(['GET'])
