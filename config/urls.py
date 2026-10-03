@@ -12,7 +12,6 @@ urlpatterns = [
     # 业务 API（前缀 /api/v1）
     path('api/v1/auth/', include('apps.auths.urls')),
     path('api/v1/catalog/', include('apps.catalog.urls')),
-    path('api/v1/seat/', include('apps.seat.urls')),
     path('api/v1/order/', include('apps.order.urls')),
     path('api/v1/pay/', include('apps.pay.urls')),
     path('api/v1/refund/', include('apps.refund.urls')),

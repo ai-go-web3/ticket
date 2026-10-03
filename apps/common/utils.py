@@ -17,9 +17,6 @@ def gen_withdraw_no():
     return gen_order_ext_no(prefix='WD')
 
 
-def gen_lock_token():
-    return str(uuid.uuid4())
-
 
 def gen_invite_code():
     """生成推广码（4位大写字母数字，去易混字符）。"""

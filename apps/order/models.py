@@ -34,7 +34,6 @@ class TicketOrder(models.Model):
     mobile = models.CharField(max_length=20, verbose_name='取票手机')
     status = models.SmallIntegerField(verbose_name='状态')
     pay_status = models.SmallIntegerField(default=0, verbose_name='0未付 1已付 2已退')
-    lock_token = models.CharField(max_length=36, null=True, verbose_name='锁token')
     promoter_id = models.BigIntegerField(null=True, verbose_name='推广人')
     confirmed_at = models.DateTimeField(null=True, verbose_name='确认收货时间')
     close_reason = models.CharField(max_length=64, null=True, verbose_name='关闭原因')

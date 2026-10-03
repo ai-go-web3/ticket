@@ -26,8 +26,6 @@ class CreateOrderSerializer(serializers.Serializer):
     seats = serializers.ListField(child=serializers.DictField())
     mobile = serializers.CharField(required=False, allow_blank=True)
     discountAmount = serializers.IntegerField(required=False, default=0)
-    # 可选：前端选座后不再预锁座，未传时建单现场锁座
-    lockToken = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
 
 @api_view(['POST'])
@@ -81,14 +79,11 @@ def order_count(request):
 
 @api_view(['POST'])
 def cancel_order(request, order_id):
-    """取消订单（待付款 -> 已关闭，释放座位）。"""
+    """取消订单（待付款 -> 已关闭）。"""
     order = services.query_order(order_id, user_id=request.user_id)
     if order.status != TicketOrder.STATUS_PAYING:
         raise BizError('当前状态不可取消')
     from apps.order.statemachine import transition
     transition(order, TicketOrder.STATUS_CLOSED)
     TicketOrder.objects.filter(id=order.id).update(close_reason='用户主动取消')
-    from apps.seat.services import release_lock
-    if order.lock_token:
-        release_lock(order.lock_token)
     return ok(None, msg='已取消')

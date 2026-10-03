@@ -4,8 +4,7 @@
 一张标准影厅座位图，保证选座→锁座→下单端到端可跑通。
 
 后续接入麻花「座位」接口后，本模块替换为：
-    row/col/seatId/price/status 从麻花返回，已售状态用麻花数据，
-    仅「本地锁定中」的座位仍由 SeatLockItem 叠加。
+    row/col/seatId/price/status 从麻花返回，已售状态用麻花数据。
 
 数据结构约定（与前端 seat.js / 锁座入参对齐）：
     row: 排号（int，从 1 起）

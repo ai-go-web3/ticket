@@ -32,7 +32,6 @@ INSTALLED_APPS = [
     'apps.common',         # 公共（幂等/对账/任务日志）
     'apps.auths',          # 登录态/手机号绑定
     'apps.catalog',        # 城市/影片/影院/排期
-    'apps.seat',           # 座位/本地锁座
     'apps.order',          # 订单状态机
     'apps.pay',            # 微信支付
     'apps.refund',         # 退款/拦截/纠纷
@@ -163,13 +162,17 @@ MAHUA = {
 }
 
 # 订单/锁座时长（秒）
-SEAT_LOCK_TTL = int(os.environ.get('SEAT_LOCK_TTL', '600'))    # 锁座 10 分钟
 PAY_TIMEOUT = int(os.environ.get('PAY_TIMEOUT', '900'))        # 支付 15 分钟
 
 # 真实支付联调开关：强制所有订单实付金额（分）。
 # 设 PAY_AMOUNT_OVERRIDE_FEN=1 即 0.01 元走真实微信支付/放单全链路，避免联调期
 # 按票面价真金白银扣款。留空/0 = 按正常票价计费（生产必须留空或 0）。
 PAY_AMOUNT_OVERRIDE_FEN = int(os.environ.get('PAY_AMOUNT_OVERRIDE_FEN', '0') or 0)
+
+# 成本价上浮费率：麻花 fastPrice/maxSpeedPrice 是我方拿到的成本价，展示与计价前
+# 统一先上浮该比例（0.05 = 上浮 5%），原价 price 为挂牌价不上浮。
+# 设 0 = 不上浮，按成本价直接展示/计价。
+PRICE_MARKUP_RATE = float(os.environ.get('PRICE_MARKUP_RATE', '0.05') or 0)
 
 # JWT
 JWT_EXPIRE_SECONDS = int(os.environ.get('JWT_EXPIRE_SECONDS', '7200'))

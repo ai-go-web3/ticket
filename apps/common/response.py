@@ -30,8 +30,6 @@ class ErrorCode:
     NOT_FOUND = 40400
     PHONE_BIND_FAILED = 40010     # 手机号获取/绑定失败（非登录失效，勿用 40100，以免前端误清 token 重登）
     # 交易
-    SEAT_TAKEN = 41001            # 座位已被抢占
-    SEAT_LOCK_EXPIRED = 41002     # 锁座已过期
     ORDER_STATE_ILLEGAL = 42001   # 非法状态迁移
     ORDER_NOT_EXIST = 42002
     PAY_NOT_DONE = 43001

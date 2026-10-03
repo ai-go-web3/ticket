@@ -8,7 +8,6 @@ from django.db import transaction
 from apps.common.response import BizError, ErrorCode
 from apps.common.utils import gen_order_ext_no
 from apps.order.models import TicketOrder, OrderPayment, MahuaDispatch
-from apps.seat.services import verify_lock, consume_lock, lock_seats
 from apps.catalog import services as catalog_services
 from apps.catalog.models import Schedule, Movie, Cinema
 
@@ -18,11 +17,9 @@ logger = logging.getLogger('app')
 def create_order(user_id, payload):
     """建「待支付」单。
 
-    payload: { scheduleId, seats, mobile, discountAmount, lockToken(可选) }
-    前端选座后不再预锁座（v1/seat/lock）：未带 lockToken 时建单现场锁座，
-    复用同一套唯一键防超卖；带 lockToken 则按旧流程校验已有锁。
+    payload: { scheduleId, seats, mobile, discountAmount }
+    不做本地锁座：座位最终是否可得由麻花放单结果收敛（放单失败走自动退款）。
     """
-    lock_token = payload.get('lockToken') or None
     schedule_id = payload['scheduleId']
     seats = payload['seats']
     mobile = payload.get('mobile') or ''
@@ -34,22 +31,15 @@ def create_order(user_id, payload):
         from apps.auths.models import AppUser
         mobile = AppUser.objects.filter(id=user_id).values_list('phone', flat=True).first() or ''
 
-    # 现场锁座 + 落单同一事务：落单失败时锁一并回滚，避免座位被悬空锁占用
     with transaction.atomic():
-        # 1. 锁：未预锁则现场锁（场次可售校验在 lock_seats 内同一口径拦截）
-        if lock_token:
-            verify_lock(lock_token, schedule_id)
-        else:
-            lock_token, _, _ = lock_seats(user_id, schedule_id, seats)
-
-        # 2. 校验场次可售（未删 + 在售 + 未过停售线，与列表/选座/锁座同一口径）
+        # 1. 校验场次可售（未删 + 在售 + 未过停售线，与列表/选座同一口径）
         try:
             schedule = Schedule.objects.get(id=schedule_id, deleted=0)
         except Schedule.DoesNotExist:
             raise BizError('场次不存在', code=40400)
         catalog_services.ensure_sellable(schedule)
 
-        # 3. 计算金额（分）：按优惠出票价（salePrice，缺省回退原价 price）
+        # 2. 计算金额（分）：按优惠出票价（salePrice，缺省回退原价 price）
         ticket_amount = sum(int(s.get('salePrice') or s['price']) for s in seats)
         service_fee = 300 * len(seats)  # 服务费 3元/座
         pay_amount = ticket_amount + service_fee - discount
@@ -62,13 +52,7 @@ def create_order(user_id, payload):
         if override_fen > 0:
             pay_amount = override_fen
 
-        # 4. 落单（幂等：同一 lockToken 重复建单返回原单）
-        existing = TicketOrder.objects.filter(
-            user_id=user_id, lock_token=lock_token, deleted=0,
-        ).first()
-        if existing:
-            return existing
-
+        # 3. 落单（幂等由微信支付回调 pay_no 幂等 + 放单 outId 幂等兜底）
         order = TicketOrder.objects.create(
             order_ext_no=gen_order_ext_no(),
             user_id=user_id,
@@ -84,7 +68,6 @@ def create_order(user_id, payload):
             pay_amount=pay_amount,
             mobile=mobile,
             status=TicketOrder.STATUS_PAYING,
-            lock_token=lock_token,
         )
     return order
 
@@ -94,7 +77,7 @@ def mark_paid(order_id, pay_no, amount, callback_raw=None):
 
     事务边界（同一事务内完成）：
         1. 支付流水落库（pay_no 唯一幂等，防微信重复回调）
-        2. 订单状态迁移：待付款(10) -> 出票中(20)，消费座位锁
+        2. 订单状态迁移：待付款(10) -> 出票中(20)
         3. 本地生成放单订单（mahua_dispatch 落库）
         4. 调用麻花 /api/movie-server/movie/put/add 真实放单
 
@@ -132,10 +115,6 @@ def mark_paid(order_id, pay_no, amount, callback_raw=None):
 
         # 状态迁移：待付款 -> 出票中
         transition(order, TicketOrder.STATUS_DISPATCHING)
-
-        # 消费锁
-        if order.lock_token:
-            consume_lock(order.lock_token, order_id)
 
         # 同一事务内：本地生成放单订单 + 调用麻花放单接口 /api/movie-server/movie/put/add
         try:
@@ -185,21 +164,18 @@ def close_if_expired(order):
 
 
 def _close_expired(order):
-    """关闭超时未付订单：待付款 -> 已关闭 + 释放座位。
+    """关闭超时未付订单：待付款 -> 已关闭。
 
     并发兜底：关闭瞬间用户可能刚好支付成功（状态/版本已变），
     迁移失败时静默放弃，交给支付链路处理。
     """
     from apps.order.statemachine import transition
-    from apps.seat.services import release_lock
     try:
         transition(order, TicketOrder.STATUS_CLOSED)
     except BizError as exc:
         logger.info('超时关单跳过（状态已变更） order=%s err=%s', order.order_ext_no, exc)
         return False
     TicketOrder.objects.filter(id=order.id).update(close_reason='超时未支付自动关闭')
-    if order.lock_token:
-        release_lock(order.lock_token)
     logger.info('超时未付订单已自动关闭 order=%s', order.order_ext_no)
     return True
 

@@ -265,7 +265,7 @@ def schedules(request):
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def schedule_seats(request, schedule_id):
-    """场次座位图：实时取麻花真实座位（含 seatId）+ 每座价格，叠加本地锁定。
+    """场次座位图：实时取麻花真实座位（含 seatId）+ 每座价格。
 
     麻花座位「禁止拉取同步、实时获取」，故每次调用实时拉取；麻花异常时回退
     seat_map 生成的兜底图（保证选座页不空）。返回体带 showId（麻花场次ID）与
@@ -292,17 +292,6 @@ def schedule_seats(request, schedule_id):
     else:
         # 兜底：确定性生成（骨架演示/无真实数据时）
         rows, hall_name, price = seat_map.gen_seat_map(schedule)
-
-    # 叠加「已锁」状态（他人/本场次进行中的锁）
-    from apps.seat.models import SeatLockItem
-    locked = set(
-        SeatLockItem.objects.filter(schedule_id=schedule_id)
-        .values_list('seat_no', flat=True)
-    )
-    for r in rows:
-        for s in r['seats']:
-            if s['name'] in locked and s['status'] == 0:
-                s['status'] = 4  # 4 = 锁定（不可选）
 
     return ok({
         'scheduleId': schedule_id,

@@ -76,6 +76,18 @@ def _parse_price(value):
         return None
 
 
+def _markup_fen(fen):
+    """成本价(分)按 settings.PRICE_MARKUP_RATE 上浮，四舍五入到分。
+
+    麻花 fastPrice/maxSpeedPrice 是我方成本价，展示与计价前统一先上浮
+    （默认 5%），原价 price 为挂牌价不上浮。费率设 0 即不上浮。
+    """
+    if not fen or fen <= 0:
+        return fen
+    rate = float(getattr(settings, 'PRICE_MARKUP_RATE', 0.05) or 0)
+    return int(round(fen * (1 + rate)))
+
+
 def _parse_date(value):
     """解析日期字符串，失败返回 None。"""
     if not value:
@@ -195,6 +207,7 @@ def _upsert_schedule(data):
     """单条排片入库（字段映射 §3.3）。
 
     麻花 price=原价(挂牌价)，fastPrice=快速出票最低价（真实最低可售口径）；
+    min_price 存「上浮后优惠售价」（fast 优先 → maxSpeed → 原价），原价存 origin_price；
     end_at 用场次返回的 duration 推算（散场时间），接口未给时留空。
     """
     show_id = data.get('showId')
@@ -207,6 +220,7 @@ def _upsert_schedule(data):
 
     price = _parse_price(data.get('price'))
     fast_price = _parse_price(data.get('fastPrice'))
+    max_speed_price = _parse_price(data.get('maxSpeedPrice'))
     start = _parse_datetime(data.get('showTime')) or timezone.now()
     # 停售时间：我方放单不传 model，麻花默认 0-特惠模式，故以「特惠停售时间」为准。
     # 兼容报文里可能只给其中一种口径，按 common -> 通用 stopsellTime -> fast 依次兜底；
@@ -228,7 +242,10 @@ def _upsert_schedule(data):
         'stopsell_at': stopsell,
         'show_type': data.get('planType') or data.get('showVersionType'),
         'language': data.get('language'),
-        'min_price': fast_price if fast_price is not None else (price if price is not None else 0),
+        # min_price=优惠售价（分）：fastPrice 优先，其次 maxSpeedPrice，最后原价兜底；
+        # fast/maxSpeed 为成本价，先按 PRICE_MARKUP_RATE 上浮再入库，与座位口径一致
+        'min_price': _seat_sale_price(
+            price, _markup_fen(fast_price), _markup_fen(max_speed_price)) or 0,
         'origin_price': price,
         'snapshot_at': timezone.now(),
     }
@@ -663,11 +680,37 @@ def pull_schedules(mahua_cinema_id, up_movie_id=None):
 
 
 def _seat_sale_price(price_fen, fast_fen, max_speed_fen):
-    """优惠出票价：fastPrice 优先，缺失/非正则取 maxSpeedPrice，再兜底原价。"""
+    """优惠出票价(分)：上浮后 fastPrice 优先，缺失/非正则取上浮后 maxSpeedPrice，再兜底原价。
+
+    入参 fast/maxSpeed 应先经 _markup_fen 上浮；price_fen 为挂牌原价不上浮。
+    保护：上浮后售价高于原价时按原价卖（售价不高于票面原价）。
+    """
     for v in (fast_fen, max_speed_fen):
         if v and v > 0:
+            if price_fen and price_fen > 0:
+                return min(v, price_fen)
             return v
     return price_fen
+
+
+def _parse_region_prices(raw):
+    """麻花 movieFilmSeatPrices（区域价格表）→ {sectionId: (price, fast, maxSpeed)}（分）。
+
+    值有两种形态：对象 {price, fastPrice, maxSpeedPrice} 或纯数字（仅原价，
+    见接口文档示例）。座位级的 fastPrice/maxSpeedPrice 常缺失，需按
+    seat.sectionId 回退到该表取价。
+    """
+    out = {}
+    for k, v in (raw or {}).items():
+        if isinstance(v, dict):
+            out[str(k)] = (
+                _parse_price(v.get('price')),
+                _parse_price(v.get('fastPrice')),
+                _parse_price(v.get('maxSpeedPrice')),
+            )
+        else:
+            out[str(k)] = (_parse_price(v), None, None)
+    return out
 
 
 def pull_seats(show_id):
@@ -677,7 +720,13 @@ def pull_seats(show_id):
     返回 (rows, restrictions, min_price_fen)：
         rows: [{'row': int, 'seats': [{col,name,seatId,status,price,salePrice}, ...]}, ...]
         price/salePrice 单位为分；status 0可售/1已售/3不可售。
-        price=票面原价；salePrice=优惠价（fastPrice 优先，无则 maxSpeedPrice，再无原价）。
+        price=票面原价（不上浮）；salePrice=优惠售价（上浮后 fastPrice 优先，
+        无则上浮后 maxSpeedPrice，再无原价）；fastPrice/maxSpeedPrice 为已上浮值，
+        前端确认页双模式计价直接使用，全链路同一口径。
+
+    取价口径：座位级 fastPrice/maxSpeedPrice 真实报文常缺失（示例仅返回 price），
+    缺失时按 seat.sectionId 回退 movieFilmSeatPrices 区域价格表，再回退默认区域；
+    原价同理（座位 price 缺失用区域价）。
     """
     client, token = _mahua()
     code, data = client.get_seats_realtime(token, show_id)
@@ -686,6 +735,8 @@ def pull_seats(show_id):
 
     seat_data = data.get('movieFilmSeatData') or []
     restrictions = data.get('restrictions')
+    region_prices = _parse_region_prices(data.get('movieFilmSeatPrices'))
+    default_region = region_prices.get('0') or next(iter(region_prices.values()), None)
 
     grouped = {}
     for s in seat_data:
@@ -694,9 +745,20 @@ def pull_seats(show_id):
             c = int(s.get('columnNo'))
         except (TypeError, ValueError):
             continue
+        region = region_prices.get(str(s.get('sectionId') or '')) or default_region or (None, None, None)
+        rp, rfast, rmax = region
+
         price_fen = _parse_price(s.get('price'))
-        fast_fen = _parse_price(s.get('fastPrice'))
-        max_speed_fen = _parse_price(s.get('maxSpeedPrice'))
+        if price_fen is None:
+            price_fen = rp
+        # 成本价先上浮再下发：座位chip、选座合计、建单 salePrice 全链路同一口径。
+        # 座位级缺失 → 区域价 → （仍无则保持 None，salePrice 兜底原价）
+        fast_fen = _markup_fen(_parse_price(s.get('fastPrice')))
+        if fast_fen is None:
+            fast_fen = _markup_fen(rfast)
+        max_speed_fen = _markup_fen(_parse_price(s.get('maxSpeedPrice')))
+        if max_speed_fen is None:
+            max_speed_fen = _markup_fen(rmax)
         seat = {
             'col': c,
             'name': s.get('seatNo'),                 # 展示 + 放单 row/col 从此名解析
@@ -704,8 +766,8 @@ def pull_seats(show_id):
             'status': _MAHUA_SEAT_STATUS.get(s.get('status'), 3),
             'price': price_fen,
             'salePrice': _seat_sale_price(price_fen, fast_fen, max_speed_fen),
-            'fastPrice': fast_fen,          # 快速出票价（分），放单 model=1
-            'maxSpeedPrice': max_speed_fen, # 极速/更深优惠价（分），放单 model=2
+            'fastPrice': fast_fen,          # 快速出票价（分，已上浮）
+            'maxSpeedPrice': max_speed_fen, # 极速/更深优惠价（分，已上浮）
             'lovestatus': s.get('lovestatus', 0),
             'area': s.get('area'),
         }
