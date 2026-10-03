@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 from django.conf import settings
 from django.core.cache import cache
 from django.core.management import call_command
+from django.db.models import F
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
@@ -362,10 +363,32 @@ def pull_regions(mahua_city_id, date=None, up_movie_id=None, ttl=300):
 # 缓存 TTL 内直接读本地库；麻花失败降级返回本地已有数据。替代原每日定时同步。
 # ---------------------------------------------------------------------------
 
-MOVIES_CACHE_TTL = 3600     # 热映列表缓存 1 小时
+MOVIES_CACHE_TTL = 7200     # 热映列表缓存 2 小时
 COMING_CACHE_TTL = 43200    # 待映列表缓存 12 小时
+DEGRADED_CACHE_TTL = 1800   # 麻花拉取失败降级读 DB 的短缓存 30 分钟（故障期不再每请求打麻花）
 COMING_LIST_MAX_ITEMS = 30  # 列表接口按需拉取待映条数上限（comingList 每页 10 条）
 COMING_PULL_MAX_ITEMS = 100  # 定时全量拉取待映条数上限
+
+
+def _run_async(fn, *args):
+    """DB 维护类写操作（下线/清理）异步执行：不阻塞列表请求，失败仅记日志。
+
+    用短命守护线程实现（无 Celery 等重型依赖）；线程内用独立 DB 连接，
+    结束时显式关闭，避免连接泄漏。
+    """
+    import threading
+
+    def _wrap():
+        try:
+            fn(*args)
+        except Exception as exc:  # noqa: BLE001 - 后台任务失败不影响主流程
+            logger.warning('异步任务 %s 失败: %s', getattr(fn, '__name__', fn), exc)
+        finally:
+            from django.db import connections
+            connections.close_all()
+
+    threading.Thread(target=_wrap, daemon=True,
+                     name=f'async-{getattr(fn, "__name__", "task")}').start()
 
 
 def unwrap_mahua_list(code, data):
@@ -449,24 +472,54 @@ def cleanup_stale_coming():
 
 
 def _movies_queryset(status):
-    """影片列表查询集（已按展示规则排序）。热映：想看倒序+上映日期正序；待映：上映日期正序。"""
+    """影片列表查询集（已按展示规则排序）。热映：想看倒序+上映日期正序；
+    已确认无排片的影片沉底（仍展示、置灰引导，不直接隐藏）。"""
     if status == 'hot':
         return (Movie.objects.filter(deleted=0, status=Movie.STATUS_HOT)
-                .order_by('-want_count', 'release_date'))
+                .order_by(F('no_show_at').asc(nulls_first=True),
+                          '-want_count', 'release_date'))
     return (Movie.objects.filter(deleted=0, status=Movie.STATUS_COMING)
             .order_by('release_date'))
 
 
-def pull_movies(mahua_city_id=None, status='hot', ttl=None, max_items=None):
-    """按需拉影片：读写穿透 + TTL 缓存 + 失败降级，返回本地 Movie 查询集。
+def _retire_stale_hot(pull_started):
+    """热映下线兜底：麻花城市热映列表只增不减地 upsert，影片从列表消失后
+    本地仍标热映，导致「列表可点、点进去无排片」（如长尾老片）。
+
+    在每次热映拉取成功后调用：把 updated_at 早于本次拉取开始的在映影片置为
+    已下线——本次列表包含的影片刚被 upsert 刷新过 updated_at，多城市场景下
+    其他城市列表刷新的影片也不会误伤；即便极端时序误下线，该城市下次拉取
+    会重新 upsert 回热映，自愈。
+    """
+    n = Movie.objects.filter(
+        deleted=0, status=Movie.STATUS_HOT, updated_at__lt=pull_started,
+    ).update(status=Movie.STATUS_OFFLINE)
+    if n:
+        logger.info('热映下线 %s 部（麻花城市列表已移除）', n)
+    return n
+
+
+def _serialized_movies(status):
+    """按展示规则取 DB 影片并序列化为响应数组（数据缓存未命中/降级时构建）。"""
+    from apps.catalog.serializers import MovieSerializer
+    return MovieSerializer(_movies_queryset(status), many=True).data
+
+
+def get_movies_payload(mahua_city_id=None, status='hot', ttl=None, max_items=None):
+    """影片列表：内存数据缓存优先，未命中拉麻花，失败降级 DB 构建。
+
+    缓存语义（真·数据缓存，命中零 DB 查询）：
+    - cache 直接存序列化后的影片数组（list[dict]），命中即返回，不碰 DB；
+    - 拉取成功：构建负载并缓存 2 小时（热映）/ 12 小时（待映）；
+    - 拉取失败：用 DB 现有数据构建负载兜底，只缓存 30 分钟——故障期不逐请求
+      打麻花，30 分钟后自动重试恢复。
+    - 热映下线维护（_retire_stale_hot）与待映清理（cleanup_stale_coming）
+      均异步执行，不阻塞列表请求。
 
     - 热映：movieOnInfoList(ci=麻花城市id)，城市维度数据，mahua_city_id 必传
       （视图层用 resolve_city_code 归一，解析不出时回退 SYNC_DEFAULT_CITY）。
-      缓存 1 小时。
     - 待映：comingList(pageNum)，麻花该接口无城市维度，全国列表；按需最多拉
-      max_items（默认 30）条，缓存 12 小时。
-    - 流程：缓存未命中 → 实时调麻花 → upsert 本地 → 写缓存标记 → 查本地返回；
-      TTL 内直接查本地；麻花失败/超时降级返回本地旧数据（不抛错，保证可用性）。
+      max_items（默认 30）条。
     """
     if status == 'hot':
         ttl = ttl or MOVIES_CACHE_TTL
@@ -474,18 +527,24 @@ def pull_movies(mahua_city_id=None, status='hot', ttl=None, max_items=None):
         ttl = ttl or COMING_CACHE_TTL
         max_items = max_items or COMING_LIST_MAX_ITEMS
     tag = 'national' if status == 'coming' else str(mahua_city_id)
-    key = 'mahua:movies:%s:%s' % (tag, status)
+    key = 'mahua:movies:data:%s:%s' % (tag, status)
     try:
-        if cache.get(key) is not None:
-            return _movies_queryset(status)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
     except Exception:  # noqa: BLE001 - 缓存不可用时降级直连
         pass
 
+    pull_started = timezone.now()
     try:
         client, token = _mahua()
         if status == 'hot':
             code, data = client.get_hot_movies(token, mahua_city_id)
             items = unwrap_mahua_list(code, data)
+            if not items:
+                # 空列表不是合法业务结果（token 失效/限频/接口异常都表现为 rtnData 空）。
+                # 必须按失败降级：若当成功放行，后续下线维护会把全部在映影片误杀。
+                raise RuntimeError('麻花热映列表为空(rtnCode=%s)' % code)
             created, updated = upsert_movies(items, Movie.STATUS_HOT)
             logger.info('实时拉热映 city=%s 命中 %s（新增 %s 更新 %s）',
                         mahua_city_id, len(items), created, updated)
@@ -503,18 +562,31 @@ def pull_movies(mahua_city_id=None, status='hot', ttl=None, max_items=None):
                 pulled += len(items)
                 if pulled >= max_items:
                     break
+            if pulled == 0:
+                raise RuntimeError('麻花待映列表为空(rtnCode=%s)' % code)
             logger.info('实时拉待映 上限%s条（新增 %s 更新 %s）', max_items, created, updated)
+
+        # 拉取成功：序列化结果直接进内存缓存（命中路径不再读 DB）
+        payload = _serialized_movies(status)
         try:
-            cache.set(key, 1, ttl)
+            cache.set(key, payload, ttl)
         except Exception:  # noqa: BLE001
             pass
-        if status == 'coming':
-            cleanup_stale_coming()
-    except Exception as exc:  # noqa: BLE001 - 麻花失败：降级返回本地旧数据
-        logger.error('按需拉影片失败 status=%s city=%s：%s（降级返回本地数据）',
-                     status, tag, exc)
-
-    return _movies_queryset(status)
+        # DB 维护（下线/清理）异步做，不占用请求耗时
+        if status == 'hot':
+            _run_async(_retire_stale_hot, pull_started)
+        else:
+            _run_async(cleanup_stale_coming)
+        return payload
+    except Exception as exc:  # noqa: BLE001 - 麻花失败：降级用 DB 数据兜底
+        logger.error('按需拉影片失败 status=%s city=%s：%s（降级返回本地数据，%s 分钟内不再重试）',
+                     status, tag, exc, DEGRADED_CACHE_TTL // 60)
+        payload = _serialized_movies(status)
+        try:
+            cache.set(key, payload, DEGRADED_CACHE_TTL)
+        except Exception:  # noqa: BLE001
+            pass
+        return payload
 
 
 def run_coming_pull(max_items=COMING_PULL_MAX_ITEMS):
@@ -537,7 +609,11 @@ def run_coming_pull(max_items=COMING_PULL_MAX_ITEMS):
             code, data = client.get_coming_movies(token, p)
             items = unwrap_mahua_list(code, data)
             if not items:
-                stopped_by = 'empty'
+                # 首页即空不是合法结果（token 失效/接口异常），置为 error：
+                # 不写缓存、不触发清理，避免把空数据固化 12 小时
+                stopped_by = 'empty' if p > 1 else 'error'
+                if p == 1:
+                    logger.error('待映全量拉取首页即为空(rtnCode=%s)，疑似 token 失效/接口异常', code)
                 break
             c, u = upsert_movies(items, Movie.STATUS_COMING)
             created += c
@@ -550,8 +626,10 @@ def run_coming_pull(max_items=COMING_PULL_MAX_ITEMS):
         return {'items': pulled, 'created': created, 'updated': updated, 'stopped_by': 'error'}
 
     if stopped_by == 'empty':
+        # 全量拉取成功：同步刷新内存数据缓存（列表接口 12 小时内直接回内存）
         try:
-            cache.set('mahua:movies:national:coming', 1, COMING_CACHE_TTL)
+            cache.set('mahua:movies:data:national:coming',
+                      _serialized_movies(Movie.STATUS_COMING), COMING_CACHE_TTL)
         except Exception:  # noqa: BLE001
             pass
     if stopped_by != 'error':

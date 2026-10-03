@@ -33,10 +33,13 @@ class Command(BaseCommand):
             return
         self.stdout.write(f'使用麻花 token={token[:8]}...')
 
+        from django.utils import timezone
+        hot_started = timezone.now()
         hot_created, hot_updated = self._sync_list(
             client.get_hot_movies(token, city_id), Movie.STATUS_HOT)
+        retired = catalog_services._retire_stale_hot(hot_started)
         self.stdout.write(self.style.SUCCESS(
-            f'热映同步完成：新增 {hot_created}，更新 {hot_updated}'))
+            f'热映同步完成：新增 {hot_created}，更新 {hot_updated}，下线 {retired}'))
 
         com_created = com_updated = 0
         for p in range(1, pages + 1):

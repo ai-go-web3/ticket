@@ -42,6 +42,10 @@ class Movie(models.Model):
     description = models.TextField(null=True, verbose_name='简介')
     want_count = models.IntegerField(default=0, verbose_name='想看人数')
     presale = models.SmallIntegerField(default=0, verbose_name='预售/特惠 1是 0否')
+    no_show_at = models.DateTimeField(
+        null=True, blank=True,
+        verbose_name='麻花确认无排片时间(按影片查影院返回权威空集时打标)',
+    )
     version = models.IntegerField(default=0, verbose_name='乐观锁')
     deleted = models.SmallIntegerField(default=0, verbose_name='软删')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')

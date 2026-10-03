@@ -49,15 +49,18 @@ class MovieSerializer(serializers.ModelSerializer):
         return fmt_release(obj.release_date)
 
     def get_buy_tag(self, obj):
-        """购票按钮文案：热映=提前购/特惠购，待映=提前购/预约。"""
+        """购票按钮文案：热映=提前购/特惠购，待映=提前购/预约；
+        麻花确认当前城市已无排片的影片显示灰色「暂无排片」（仍可进详情看后续日期）。"""
+        if getattr(obj, 'no_show_at', None):
+            return '暂无排片'
         if obj.status == Movie.STATUS_COMING:
             return '提前购' if obj.presale else '预约'
         return '提前购' if obj.presale else '特惠购'
 
     def get_buy_tag_type(self, obj):
-        """按钮配色：blue=提前购 pink=特惠购 orange=预约。"""
+        """按钮配色：blue=提前购 pink=特惠购 orange=预约 gray=暂无排片。"""
         tag = self.get_buy_tag(obj)
-        return {'提前购': 'blue', '特惠购': 'pink', '预约': 'orange'}.get(tag, 'pink')
+        return {'提前购': 'blue', '特惠购': 'pink', '预约': 'orange', '暂无排片': 'gray'}.get(tag, 'pink')
 
 
 class CinemaSerializer(serializers.ModelSerializer):

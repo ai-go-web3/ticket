@@ -32,9 +32,10 @@ def movies(request):
     """影片列表。status: 1热映 2待映。
 
     热映支持 cityCode（前端当前城市，麻花 cityId 或国标码）：实时拉麻花
-    movieOnInfoList(ci=城市id)，读写穿透本地库并缓存 1 小时；城市解析失败
-    回退 SYNC_DEFAULT_CITY。待映为全国列表（麻花 comingList 无城市维度），
-    按需最多拉 30 条、缓存 12 小时。两类均走本地库返回，麻花失败降级旧数据。
+    movieOnInfoList(ci=城市id)，序列化结果直接进内存缓存（命中零 DB 查询，
+    2 小时）；城市解析失败回退 SYNC_DEFAULT_CITY。待映为全国列表（麻花
+    comingList 无城市维度），按需最多拉 30 条、缓存 12 小时。
+    拉取失败降级用 DB 数据兜底并短缓存 30 分钟。
     """
     status = request.query_params.get('status', '1')
     if status == '1':
@@ -42,10 +43,8 @@ def movies(request):
         mahua_city = catalog_services.resolve_city_code(city_code) if city_code else None
         if not mahua_city:
             mahua_city = str(getattr(settings, 'SYNC_DEFAULT_CITY', '8'))
-        qs = catalog_services.pull_movies(mahua_city, status='hot')
-    else:
-        qs = catalog_services.pull_movies(status='coming')
-    return ok(MovieSerializer(qs, many=True).data)
+        return ok(catalog_services.get_movies_payload(mahua_city, status='hot'))
+    return ok(catalog_services.get_movies_payload(status='coming'))
 
 
 @api_view(['GET'])
@@ -66,6 +65,29 @@ def _haversine(lng1, lat1, lng2, lat2):
     dlat = radians(lat2 - lat1)
     a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
     return 2 * r * asin(sqrt(a))
+
+
+def _mark_no_show(movie, pulled_up_ids, date):
+    """麻花权威空/非空结果 → 维护影片「无排片」标记（Movie.no_show_at）。
+
+    闭环节路：麻花热映列表(movieOnInfoList)会挂着当前已无任何场次的长尾影片，
+    列表页仍按「特惠购」推荐，用户点进详情却是空列表。这里在按影片查影院的
+    权威结果处回写标记：
+      - 查的就是今天（显式或默认补齐）且麻花返回空集 → 打标（列表显示「暂无排片」）；
+      - 任意日期查到有排片 → 清标（影片恢复可售推荐，不怕误伤复映/晚场影片）。
+    """
+    if movie is None:
+        return
+    today = timezone.now().date().isoformat()
+    try:
+        if pulled_up_ids:
+            # 有排片即恢复可售（幂等：未标记时 update 命中 0 行）
+            Movie.objects.filter(id=movie.id).exclude(no_show_at=None).update(no_show_at=None)
+        elif date == today:
+            Movie.objects.filter(id=movie.id, no_show_at=None).update(no_show_at=timezone.now())
+    except Exception:  # noqa: BLE001 - 标记失败不影响主流程
+        import logging
+        logging.getLogger('app').warning('维护影片无排片标记失败 movie=%s', movie.id)
 
 
 @api_view(['GET'])
@@ -118,6 +140,7 @@ def cinemas(request):
             # 避免依赖尚未同步的本地排片表（否则会把结果误过滤为空）。
             if up_movie_id:
                 pulled_up_ids = {str(c.get('cinemaId')) for c in pulled if c.get('cinemaId') is not None}
+                _mark_no_show(mv, pulled_up_ids, date)
         except Exception as exc:  # noqa: BLE001
             pull_failed = True
             import logging
