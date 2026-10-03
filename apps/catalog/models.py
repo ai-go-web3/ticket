@@ -119,6 +119,9 @@ class Schedule(models.Model):
     min_price = models.BigIntegerField(default=0, verbose_name='最低价(分)')
     origin_price = models.BigIntegerField(null=True, blank=True, verbose_name='原价(分)')
     settle_price = models.BigIntegerField(null=True, verbose_name='结算价(分)')
+    # 麻花原始价格快照（未上浮，分）：{price, fastPrice, maxSpeedPrice}，每次拉排片刷新。
+    # min_price 存的是上浮后售价，本字段留原始成本口径供对账/审计。
+    raw_price_json = models.JSONField(null=True, blank=True, verbose_name='麻花原始价快照')
     remain_seats = models.IntegerField(null=True, verbose_name='余票')
     refundable = models.SmallIntegerField(default=0, verbose_name='可退')
     endorseable = models.SmallIntegerField(default=0, verbose_name='可改签')

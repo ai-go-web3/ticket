@@ -47,8 +47,11 @@ PROTECTED_PREFIXES = (
     '/api/v1/pay/unified',
     '/api/v1/pay/mock',
     '/api/v1/auth/profile',
+    '/api/v1/auth/update-profile',
     '/api/v1/auth/bind-phone',
 )
+# 受保护前缀中的豁免路径（运维接口，走 TASK_TOKEN 自鉴权）
+PROTECTED_EXEMPT_PATHS = ('/api/v1/order/finance/daily',)
 
 
 class JWTAuthMiddleware:
@@ -79,6 +82,7 @@ class JWTAuthMiddleware:
             request.user_id = uid  # 公开接口若带有效 token 也顺带注入
 
         protected = any(path.startswith(p) for p in PROTECTED_PREFIXES)
+        protected = protected and not any(path.startswith(e) for e in PROTECTED_EXEMPT_PATHS)
         if protected and request.method != 'OPTIONS' and uid is None:
             return JsonResponse(
                 {'code': 40100, 'msg': '未登录或登录已失效', 'data': None},

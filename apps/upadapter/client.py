@@ -6,6 +6,7 @@
 import json
 import logging
 import re
+from datetime import timedelta
 
 from apps.common.response import BizError
 from apps.order.models import TicketOrder, MahuaDispatch
@@ -78,6 +79,10 @@ def build_dispatch_payload(order, call_back_url=None):
         'buySeats': buy_seats,
         'acceptChangeseat': '1',
     }
+    # 出票模式（0特惠/1快速/2极速，见放单文档 §4.1）：特惠不传（麻花默认 0），
+    # 快速购票单传 model=2 极速通道，与用户所购模式一致
+    if getattr(order, 'buy_mode', '') == 'kuai':
+        payload['model'] = 2
     if call_back_url:
         payload['callBackUrl'] = call_back_url
     if order.mobile:
@@ -254,6 +259,64 @@ def _on_ticketed(order, data):
         Ticket.objects.bulk_create(objs)
 
 
+def compensate_dispatches(limit=50):
+    """放单补偿任务（内置定时器调用），闭环收敛两类卡单：
+
+    1. STATUS_PENDING（放单提交超时/异常，文档约定用查询接口收敛）：
+       先查 /put/query——查得到则按查询结果收敛订单；查不到（rtnCode 非成功，
+       麻花未受理该单）说明提交根本没到达，重新放单（outId 幂等，不会重复扣款）。
+    2. 放单成功但回调丢失：订单长时间停在「出票中」（超过 DISPATCH_STALE_SECONDS
+       无状态更新），主动查询放单结果收敛。
+
+    仅当订单仍处于「出票中」时才重放/迁移；已进入退款等后续链路的单不碰。
+    """
+    from django.conf import settings as dj_settings
+    from django.utils import timezone
+
+    if not dj_settings.MAHUA.get('BASE_URL'):
+        return {'pending': 0, 'redispatched': 0, 'synced': 0, 'stale': 0}
+
+    res = {'pending': 0, 'redispatched': 0, 'synced': 0, 'stale': 0}
+
+    pendings = MahuaDispatch.objects.filter(
+        dispatch_status=MahuaDispatch.STATUS_PENDING,
+    )[:limit]
+    for d in pendings:
+        res['pending'] += 1
+        try:
+            client = MahuaClient()
+            code, data = client.query_order(get_token(), d.order_ext_no)
+        except Exception as exc:  # noqa: BLE001 网络/非JSON报文：下轮再试
+            logger.warning('放单补偿查询异常 order=%s err=%s', d.order_ext_no, exc)
+            continue
+        if code != SUCCESS_CODE:
+            # 麻花查无此单：提交未受理，重新放单（outId 幂等）
+            order = TicketOrder.objects.filter(
+                order_ext_no=d.order_ext_no, deleted=0,
+            ).first()
+            if order and order.status == TicketOrder.STATUS_DISPATCHING:
+                logger.info('放单补偿：查无此单，重新放单 order=%s', d.order_ext_no)
+                dispatch(d.order_ext_no)
+                res['redispatched'] += 1
+        else:
+            query_and_sync(d.order_ext_no)
+            res['synced'] += 1
+
+    # 回调丢失兜底：出票中超阈值的订单主动查询
+    stale_seconds = int(getattr(dj_settings, 'DISPATCH_STALE_SECONDS', 180) or 180)
+    deadline = timezone.now() - timedelta(seconds=stale_seconds)
+    stale_orders = TicketOrder.objects.filter(
+        status=TicketOrder.STATUS_DISPATCHING, deleted=0, updated_at__lt=deadline,
+    )[:limit]
+    for order in stale_orders:
+        try:
+            query_and_sync(order.order_ext_no)
+            res['stale'] += 1
+        except Exception as exc:  # noqa: BLE001 单笔失败不影响整批
+            logger.warning('出票轮询兜底异常 order=%s err=%s', order.order_ext_no, exc)
+    return res
+
+
 def on_order_callback(payload):
     """麻花订单回调（字段映射 §6.1）。收敛出票结果（幂等由 view 层保证）。"""
     out_id = payload.get('outId')
@@ -264,7 +327,12 @@ def on_order_callback(payload):
         raise BizError('订单不存在')
 
     if status == CALLBACK_DRAW_SUCCESS or status == CALLBACK_UPDATE:
-        # 出票成功 / 更新票（可能多次回调）
+        # 出票成功 / 更新票（可能多次回调）；confirmPrice=真实出票结算价（元）→ 分。
+        # 先落结算价再走出票迁移，避免 _on_ticketed 的 update_fields 漏存该字段。
+        confirm_price = payload.get('confirmPrice')
+        if confirm_price is not None and order.settle_amount is None:
+            order.settle_amount = int(round(float(confirm_price) * 100))
+            order.save(update_fields=['settle_amount', 'updated_at'])
         if order.status == TicketOrder.STATUS_DISPATCHING:
             _on_ticketed(order, payload)
     elif status == CALLBACK_DRAW_CLOSE:
@@ -280,9 +348,10 @@ def on_order_callback(payload):
             from apps.distributor.services import settle_commission
             settle_commission(order)
     elif status == CALLBACK_TICKET_REFUND:
-        # 已退票（关注 ticketRefundFee）：纠纷中/退款中 -> 已退款
+        # 已退票（票款已退回我方麻花账户）：需对用户原路退款 -> 已退款(80)
         if order.status in (TicketOrder.STATUS_REFUNDING, TicketOrder.STATUS_DISPUTE):
-            transition(order, TicketOrder.STATUS_REFUNDED)
+            from apps.refund.services import refund_by_up_ticket_refund
+            refund_by_up_ticket_refund(order)
 
     # 更新放单映射（关闭原因 + 按回调状态收敛放单状态）
     if payload.get('note'):

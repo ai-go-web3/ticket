@@ -31,6 +31,12 @@ class TicketOrder(models.Model):
     discount_amount = models.BigIntegerField(default=0, verbose_name='优惠(分)')
     pay_amount = models.BigIntegerField(verbose_name='实付(分)')
     settle_amount = models.BigIntegerField(null=True, verbose_name='结算价(分)')
+    # 财务快照：建单时的成本上浮费率与预估成本（Σ原始fastPrice，分）。
+    # 实际成本以 settle_amount（麻花 confirmPrice）为准；est_cost 用于选座时点预估与对账差异分析。
+    price_rate = models.FloatField(null=True, verbose_name='成本上浮费率快照')
+    est_cost_amount = models.BigIntegerField(null=True, verbose_name='预估成本(分,Σ原始fastPrice)')
+    # 购票模式：tehui=特惠（放单不传 model，麻花默认 0）；kuai=快速（放单 model=2 极速通道）
+    buy_mode = models.CharField(max_length=8, default='tehui', verbose_name='购票模式')
     mobile = models.CharField(max_length=20, verbose_name='取票手机')
     status = models.SmallIntegerField(verbose_name='状态')
     pay_status = models.SmallIntegerField(default=0, verbose_name='0未付 1已付 2已退')

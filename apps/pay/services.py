@@ -128,23 +128,42 @@ def on_pay_callback(request):
     """支付回调（微信异步通知）：验签 + 金额校验 + 幂等落库。"""
     from apps.order.services import mark_paid
 
-    try:
-        result = _xml_to_dict(request.body)
-    except Exception:  # noqa: BLE001 非 XML 报文：直接拒绝（微信只发合法 XML）
-        return {'return_code': 'FAIL', 'return_msg': 'invalid xml'}
-    if result.get('return_code') != 'SUCCESS':
-        return {'return_code': 'FAIL', 'return_msg': 'invalid notify'}
-    if result.get('result_code') != 'SUCCESS':
-        # 支付失败/关单等通知：确认收到即可，不改订单状态
-        return {'return_code': 'SUCCESS'}
+    body = request.body or b''
+    logger.info('收到支付回调 body_len=%s', len(body))
 
-    cfg = settings.WECHAT
-    if cfg.get('PAY_KEY') and not _verify_sign(dict(result), cfg['PAY_KEY']):
-        logger.error('支付回调验签失败 out_trade_no=%s', result.get('out_trade_no'))
-        return {'return_code': 'FAIL', 'return_msg': 'sign error'}
+    try:
+        result = _xml_to_dict(body)
+    except Exception as exc:  # noqa: BLE001 非 XML 报文：直接拒绝（微信只发合法 XML）
+        logger.error('支付回调报文非法(非XML) err=%s body=%s', exc, body[:512])
+        return {'return_code': 'FAIL', 'return_msg': 'invalid xml'}
 
     pay_no = result.get('transaction_id')
     order_ext_no = result.get('out_trade_no')
+
+    if result.get('return_code') != 'SUCCESS':
+        logger.error('支付回调 return_code 非SUCCESS return_code=%s return_msg=%s out_trade_no=%s',
+                     result.get('return_code'), result.get('return_msg'), order_ext_no)
+        return {'return_code': 'FAIL', 'return_msg': 'invalid notify'}
+
+    logger.info('支付回调已解析 out_trade_no=%s transaction_id=%s result_code=%s total_fee=%s',
+                order_ext_no, pay_no, result.get('result_code'), result.get('total_fee'))
+
+    if result.get('result_code') != 'SUCCESS':
+        # 支付失败/关单等通知：确认收到即可，不改订单状态
+        logger.warning('支付回调非成功通知(不改单) out_trade_no=%s result_code=%s err_code=%s err_code_des=%s',
+                       order_ext_no, result.get('result_code'),
+                       result.get('err_code'), result.get('err_code_des'))
+        return {'return_code': 'SUCCESS'}
+
+    cfg = settings.WECHAT
+    if not cfg.get('PAY_KEY'):
+        # 未配置 PAY_KEY -> 验签整段跳过、照单全收：降级环境可用，生产严禁，务必留痕。
+        logger.warning('支付回调未配置 PAY_KEY，跳过验签直接受理 out_trade_no=%s（仅降级环境，生产严禁）',
+                       order_ext_no)
+    elif not _verify_sign(dict(result), cfg['PAY_KEY']):
+        logger.error('支付回调验签失败 out_trade_no=%s', order_ext_no)
+        return {'return_code': 'FAIL', 'return_msg': 'sign error'}
+
     amount = int(result.get('total_fee', 0))
 
     try:
@@ -160,6 +179,8 @@ def on_pay_callback(request):
         return {'return_code': 'FAIL', 'return_msg': 'amount mismatch'}
 
     mark_paid(order.id, pay_no, amount, callback_raw=result)
+    logger.info('支付回调处理成功 out_trade_no=%s order_id=%s pay_no=%s 金额=%s分',
+                order_ext_no, order.id, pay_no, amount)
     return {'return_code': 'SUCCESS'}
 
 
@@ -242,6 +263,35 @@ def _decrypt_req_info(req_info_b64, pay_key):
     return padded[:-padded[-1]]  # PKCS7 去填充
 
 
+def _reconcile_order_on_refund(refund, arrived):
+    """退款通知后的订单状态对账（幂等）。
+
+    - 到账：确保订单为「已退款(80)」且支付状态已回冲（受理时已置位的跳过）；
+    - 失败：若订单已被受理时乐观置为「已退款」，回退为「退款中(70)」，
+      退款单记 FAIL，由退款重试任务（retry_failed_refunds）重新发起。
+    """
+    from apps.order.statemachine import transition
+    from apps.refund.models import Refund
+
+    order = TicketOrder.objects.filter(id=refund.order_id).first()
+    if not order:
+        return
+    if arrived:
+        if order.status == TicketOrder.STATUS_REFUNDING:
+            transition(order, TicketOrder.STATUS_REFUNDED)
+        if order.pay_status != TicketOrder.PAY_REFUNDED:
+            TicketOrder.objects.filter(id=order.id).update(
+                pay_status=TicketOrder.PAY_REFUNDED)
+    else:
+        if order.status == TicketOrder.STATUS_REFUNDED:
+            # 已退款是终态，回退需 force；受理时的乐观置位被真实结果推翻
+            transition(order, TicketOrder.STATUS_REFUNDING, force=True)
+            TicketOrder.objects.filter(id=order.id).update(
+                pay_status=TicketOrder.PAY_DONE)
+        refund.status = Refund.STATUS_FAIL
+        refund.save(update_fields=['status', 'updated_at'])
+
+
 def on_refund_notify(request):
     """退款结果通知（微信异步推送）：解密 req_info，回写退款单状态。
 
@@ -250,12 +300,23 @@ def on_refund_notify(request):
     """
     from apps.refund.models import Refund
 
-    result = _xml_to_dict(request.body)
+    body = request.body or b''
+    logger.info('收到退款通知 body_len=%s', len(body))
+
+    try:
+        result = _xml_to_dict(body)
+    except Exception as exc:  # noqa: BLE001 非 XML 报文：拒绝并留痕
+        logger.error('退款通知报文非法(非XML) err=%s body=%s', exc, body[:512])
+        return {'return_code': 'FAIL', 'return_msg': 'invalid notify'}
+
     if result.get('return_code') != 'SUCCESS' or not result.get('req_info'):
+        logger.error('退款通知无效 return_code=%s has_req_info=%s',
+                     result.get('return_code'), bool(result.get('req_info')))
         return {'return_code': 'FAIL', 'return_msg': 'invalid notify'}
 
     pay_key = settings.WECHAT.get('PAY_KEY') or ''
     if not pay_key:
+        logger.error('退款通知无法处理：未配置 PAY_KEY，无法解密 req_info')
         return {'return_code': 'FAIL', 'return_msg': 'pay key missing'}
     try:
         plain = _decrypt_req_info(result['req_info'], pay_key)
@@ -274,12 +335,16 @@ def on_refund_notify(request):
     if refund_status in ('SUCCESS', 'CHANGE'):
         refund.status = Refund.STATUS_ARRIVED
     elif refund_status in ('FAIL', 'REFUNDCLOSE'):
-        refund.status = Refund.STATUS_FAIL
         logger.error('微信退款未到账 refund=%s status=%s', out_refund_no, refund_status)
+        refund.status = Refund.STATUS_FAIL
+        _reconcile_order_on_refund(refund, arrived=False)
+        logger.info('退款通知已处理 refund=%s status=%s', out_refund_no, refund_status)
+        return {'return_code': 'SUCCESS'}
     else:
         logger.warning('退款通知未知状态 refund=%s status=%s', out_refund_no, refund_status)
         return {'return_code': 'SUCCESS'}
 
     refund.save(update_fields=['status', 'updated_at'])
+    _reconcile_order_on_refund(refund, arrived=True)
     logger.info('退款通知已处理 refund=%s status=%s', out_refund_no, refund_status)
     return {'return_code': 'SUCCESS'}

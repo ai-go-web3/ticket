@@ -7,6 +7,8 @@ class Refund(models.Model):
     TYPE_INTERCEPT = 1      # 拦截取消
     TYPE_DISPUTE = 2        # 个人原因退票(纠纷)
     TYPE_DISPATCH_FAIL = 3  # 出票失败自动退
+    TYPE_PAY_AFTER_CLOSE = 4  # 关单后支付到账（关单/支付竞态）自动原路退
+    TYPE_UP_REFUND = 5        # 麻花退票回调(ticketRefund)后对用户原路退
 
     STATUS_ACCEPTED = 10       # 受理
     STATUS_INTERCEPTING = 20   # 拦截中

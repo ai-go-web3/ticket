@@ -4,6 +4,7 @@ import logging
 from datetime import timedelta
 
 from django.db import transaction
+from django.utils import timezone
 
 from apps.common.response import BizError, ErrorCode
 from apps.common.utils import gen_order_ext_no
@@ -39,9 +40,36 @@ def create_order(user_id, payload):
             raise BizError('场次不存在', code=40400)
         catalog_services.ensure_sellable(schedule)
 
-        # 2. 计算金额（分）：按优惠出票价（salePrice，缺省回退原价 price）
-        ticket_amount = sum(int(s.get('salePrice') or s['price']) for s in seats)
-        service_fee = 300 * len(seats)  # 服务费 3元/座
+        # 2. 计算金额（分）：不收服务费，总费 = ΣsalePrice（成本上浮后的每座售价求和）。
+        #    快速模式按 maxSpeedPrice 收费、放单走极速通道，预估成本按原始 maxSpeedPrice 口径；
+        #    特惠模式按 fastPrice 收费、放单默认特惠通道，预估成本按原始 fastPrice 口径。
+        from django.conf import settings as dj_settings
+        rate = float(getattr(dj_settings, 'PRICE_MARKUP_RATE', 0.05) or 0)
+        buy_mode = payload.get('buyMode') or 'tehui'
+
+        def _raw_cost(fen):
+            """上浮后售价(分)反推原始成本价(分)：raw = round(fen/(1+rate))，±1分舍入误差。"""
+            if not fen or fen <= 0:
+                return None
+            return int(round(fen / (1 + rate))) if rate > 0 else int(fen)
+
+        ticket_amount = 0
+        est_fast = 0
+        est_max = 0
+        for s in seats:
+            sale = int(s.get('salePrice') or s['price'])
+            ticket_amount += sale
+            fast = int(s.get('fastPrice') or 0)
+            if fast > 0:
+                s['rawFast'] = _raw_cost(fast)
+                est_fast += s['rawFast']
+            ms = int(s.get('maxSpeedPrice') or 0)
+            if ms > 0:
+                s['rawMaxSpeed'] = _raw_cost(ms)
+                est_max += s['rawMaxSpeed']
+            s['salePrice'] = sale
+        est_cost = est_max if buy_mode == 'kuai' else est_fast
+        service_fee = 0
         pay_amount = ticket_amount + service_fee - discount
         if pay_amount < 0:
             pay_amount = 0
@@ -68,12 +96,15 @@ def create_order(user_id, payload):
             pay_amount=pay_amount,
             mobile=mobile,
             status=TicketOrder.STATUS_PAYING,
+            price_rate=rate,
+            est_cost_amount=est_cost or None,
+            buy_mode=buy_mode,
         )
     return order
 
 
 def mark_paid(order_id, pay_no, amount, callback_raw=None):
-    """支付成功：标记已付 + 本地生成放单订单 + 调用麻花放单接口（同一事务）。
+    """支付成功：落流水 + 标记已付 + 触发放单（同一事务）。
 
     事务边界（同一事务内完成）：
         1. 支付流水落库（pay_no 唯一幂等，防微信重复回调）
@@ -81,9 +112,13 @@ def mark_paid(order_id, pay_no, amount, callback_raw=None):
         3. 本地生成放单订单（mahua_dispatch 落库）
         4. 调用麻花 /api/movie-server/movie/put/add 真实放单
 
+    竞态处理：超时关单/用户取消与支付回调并发时，微信侧已扣款而订单已关闭——
+    不能吞掉这笔钱：对非「待付款」状态收到的新支付流水一律原路全额退款
+    （_refund_after_close），退款发起失败由退款重试任务兜底。
+
     放单请求超时/返回异常时不能回滚整个事务（微信侧已扣款）：
     dispatch() 内部吞掉异常并把放单订单记为「待补偿(6)」，由补偿任务
-    （query_and_sync / 重放任务）按文档用查询接口收敛。
+    （compensate_dispatches）按文档用查询接口收敛。
     """
     from apps.order.statemachine import transition
 
@@ -91,10 +126,6 @@ def mark_paid(order_id, pay_no, amount, callback_raw=None):
         order = TicketOrder.objects.get(id=order_id, deleted=0)
     except TicketOrder.DoesNotExist:
         raise BizError('订单不存在', code=ErrorCode.ORDER_NOT_EXIST)
-
-    if order.status != TicketOrder.STATUS_PAYING:
-        # 已处理，幂等返回
-        return order
 
     with transaction.atomic():
         # 支付流水（pay_no 唯一幂等）
@@ -105,10 +136,16 @@ def mark_paid(order_id, pay_no, amount, callback_raw=None):
                 'amount': amount,
                 'status': OrderPayment.STATUS_SUCCESS,
                 'callback_raw': callback_raw,
+                'paid_at': timezone.now(),
             },
         )
         if not created:
             return order  # 重复回调
+
+        if order.status != TicketOrder.STATUS_PAYING:
+            # 关单/退款态之后才到账的新支付（关单竞态、重复支付）：原路退款
+            _refund_after_close(order, amount)
+            return order
 
         order.pay_status = TicketOrder.PAY_DONE
         order.save(update_fields=['pay_status', 'updated_at'])
@@ -128,6 +165,35 @@ def mark_paid(order_id, pay_no, amount, callback_raw=None):
                     '放单未完成（待补偿重试） order=%s mahua_no=%s',
                     order.order_ext_no, mahua_no)
     return order
+
+
+def _refund_after_close(order, amount):
+    """订单非「待付款」状态下收到支付到账（竞态/重复支付）：原路全额退款。
+
+    订单已不在待付款态，不再走状态机；只落退款单 + 发起微信退款。
+    发起失败时退款单记 FAIL，由退款重试任务（retry_failed_refunds）兜底重发。
+    """
+    from apps.common.utils import gen_refund_no
+    from apps.refund.models import Refund
+    from apps.refund.services import refund_retry_once
+
+    logger.warning(
+        '支付到账时订单已非待付款，自动原路退款 order=%s status=%s amount=%s分',
+        order.order_ext_no, order.status, amount)
+    refund = Refund.objects.create(
+        refund_ext_no=gen_refund_no(),
+        order_id=order.id,
+        type=Refund.TYPE_PAY_AFTER_CLOSE,
+        reason='订单关闭后支付到账，自动原路退款',
+        refund_amount=amount,
+        status=Refund.STATUS_REFUNDING,
+    )
+    try:
+        refund_retry_once(order, refund)
+    except Exception as exc:  # noqa: BLE001 受理失败：退款单记 FAIL 交重试任务
+        refund.status = Refund.STATUS_FAIL
+        refund.save(update_fields=['status', 'updated_at'])
+        logger.error('关单竞态退款发起失败 order=%s err=%s', order.order_ext_no, exc)
 
 
 def query_order(order_id, user_id=None):

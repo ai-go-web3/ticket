@@ -53,6 +53,22 @@ def _run_coming_pull_job():
     )
 
 
+def _run_dispatch_compensation_job():
+    """APScheduler 回调：放单补偿（待补偿单重放/查询收敛 + 出票中超时查询兜底）。"""
+    from apps.upadapter.client import compensate_dispatches
+    res = compensate_dispatches()
+    if any(res.values()):
+        logger.info('放单补偿任务：%s', res)
+
+
+def _run_refund_retry_job():
+    """APScheduler 回调：失败微信退款重试。"""
+    from apps.refund.services import retry_failed_refunds
+    res = retry_failed_refunds()
+    if res.get('retried'):
+        logger.info('退款重试任务：%s', res)
+
+
 def _token_refresh_minutes():
     """从 settings.MAHUA['TOKEN_REFRESH']（秒）取刷新间隔分钟，<=0 表示不启用。"""
     try:
@@ -60,6 +76,14 @@ def _token_refresh_minutes():
     except (TypeError, ValueError):
         seconds = 0
     return seconds // 60
+
+
+def _int_setting(name, default):
+    """读取整型间隔配置（秒），非法值回落 default。"""
+    try:
+        return int(getattr(settings, name, default))
+    except (TypeError, ValueError):
+        return default
 
 
 def start():
@@ -113,6 +137,27 @@ def start():
     elif coming_min > 0 and not mahua_configured:
         logger.warning('麻花 BASE_URL 未配置，跳过待映拉取定时器')
 
+    # 放单补偿：STATUS_PENDING 重放/查询收敛 + 出票中超时查询兜底（依赖麻花，要求已配置）
+    dispatch_sync_seconds = _int_setting('DISPATCH_SYNC_SECONDS', 60)
+    if dispatch_sync_seconds > 0 and mahua_configured:
+        sched.add_job(
+            _run_dispatch_compensation_job,
+            IntervalTrigger(seconds=dispatch_sync_seconds),
+            id='dispatch_compensation', name='dispatch_compensation',
+            replace_existing=True, coalesce=True, misfire_grace_time=300,
+        )
+        added += 1
+
+    # 失败微信退款重试：不依赖麻花，只要配置了定时间隔即启用
+    refund_retry_seconds = _int_setting('REFUND_RETRY_SECONDS', 300)
+    if refund_retry_seconds > 0:
+        sched.add_job(
+            _run_refund_retry_job, IntervalTrigger(seconds=refund_retry_seconds),
+            id='refund_retry', name='refund_retry',
+            replace_existing=True, coalesce=True, misfire_grace_time=600,
+        )
+        added += 1
+
     if added == 0:
         logger.warning('无任何定时任务需要注册，调度器未启动')
         return None
@@ -120,9 +165,12 @@ def start():
     sched.start()
     _scheduler = sched
     logger.info(
-        '内置定时器已启动：token_refresh=%smin coming_pull=%smin tz=%s',
+        '内置定时器已启动：token_refresh=%smin coming_pull=%smin '
+        'dispatch_compensation=%ss refund_retry=%ss tz=%s',
         refresh_min if mahua_configured else 'off',
         coming_min if mahua_configured else 'off',
+        dispatch_sync_seconds if mahua_configured else 'off',
+        refund_retry_seconds,
         tz,
     )
     return sched

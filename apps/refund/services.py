@@ -11,7 +11,10 @@
 - 纠纷中(90)  --取消纠纷(1001/1003/1007)/判责(1002/1004/1008)--> 待取票(30)
 - 纠纷中(90)  --麻花已退票回调(ticketRefund)--> 已退款(80)
 
-退款顺序：先拿麻花拦截/纠纷结果，再对用户退款（未对接微信退款前骨架同步标记到账）。
+退款顺序：先拿麻花拦截/纠纷结果，再对用户发起微信退款（v2 /secapi/pay/refund，
+已对接，见 apps/pay/services.wx_refund）。微信退款被拒时退款单记 FAIL，
+由退款重试任务（retry_failed_refunds，内置定时器）兜底重发；
+到账结果以微信退款结果通知（on_refund_notify）回写为准并做订单状态对账。
 """
 import logging
 
@@ -88,6 +91,9 @@ def _intercept_refund(order, reason):
             status=Refund.STATUS_REFUNDING,
         )
         transition(order, TicketOrder.STATUS_REFUNDING)
+        # 回写放单映射：已拦截（后续 drawClose/ticketRefund 回调再收敛）
+        MahuaDispatch.objects.filter(order_ext_no=order.order_ext_no).update(
+            dispatch_status=MahuaDispatch.STATUS_INTERCEPTED)
         _do_refund_order(order, refund)
     return refund
 
@@ -153,6 +159,30 @@ def _dispute_refund(order, reason):
     return refund
 
 
+def refund_retry_once(order, refund):
+    """对单笔退款单发起/重发微信退款（退款受理的最小单元，可被重试任务复用）。
+
+    - 受理成功：记「退款中」+ 回填微信退款单号，到账由退款结果通知确认；
+    - 骨架降级（未配置证书）：直接记「已到账」并回冲支付状态，联调链路走通；
+    - 被微信拒绝：抛 BizError，调用方决定回滚/重试。
+    """
+    from apps.pay.services import wx_refund
+
+    if isinstance(refund, int):
+        refund = Refund.objects.get(id=refund)
+    _accepted, wx_no = wx_refund(order, refund)
+    if wx_no:
+        refund.wx_refund_no = wx_no
+        refund.status = Refund.STATUS_REFUNDING
+        refund.save(update_fields=['wx_refund_no', 'status', 'updated_at'])
+    else:
+        refund.status = Refund.STATUS_ARRIVED
+        refund.save(update_fields=['status', 'updated_at'])
+        TicketOrder.objects.filter(id=order.id).update(
+            pay_status=TicketOrder.PAY_REFUNDED)
+    return refund
+
+
 def _do_refund_order(order, refund):
     """执行退款：先发起微信退款，受理后订单 -> 已退款(80) + 支付状态回冲。
 
@@ -165,25 +195,22 @@ def _do_refund_order(order, refund):
         transition(order, TicketOrder.STATUS_REFUNDING)
 
     if refund is not None:
-        if isinstance(refund, int):
-            refund = Refund.objects.get(id=refund)
-        from apps.pay.services import wx_refund
-        _accepted, wx_no = wx_refund(order, refund)
-        if wx_no:
-            refund.wx_refund_no = wx_no
-            refund.status = Refund.STATUS_REFUNDING
-            refund.save(update_fields=['wx_refund_no', 'status', 'updated_at'])
-        else:
-            refund.status = Refund.STATUS_ARRIVED
-            refund.save(update_fields=['status', 'updated_at'])
+        refund_retry_once(order, refund)
 
     transition(order, TicketOrder.STATUS_REFUNDED)
     TicketOrder.objects.filter(id=order.id).update(pay_status=TicketOrder.PAY_REFUNDED)
 
 
 def auto_refund_dispatch_fail(order):
-    """出票失败自动全额退款：出票失败(60) -> 退款中(70) -> 已退款(80)。"""
+    """出票失败自动全额退款：出票失败(60) -> 退款中(70)，到账后 -> 已退款(80)。
+
+    退款单先落库提交、再在事务外发起微信退款：受理失败退款单记 FAIL，
+    由退款重试任务（retry_failed_refunds）兜底重发——避免微信拒绝时把退款单
+    连同状态迁移一起回滚，订单卡死在「出票失败」且无退款单可重试。
+    """
     with transaction.atomic():
+        if order.status == TicketOrder.STATUS_DISPATCH_FAIL:
+            transition(order, TicketOrder.STATUS_REFUNDING)
         refund = Refund.objects.create(
             refund_ext_no=gen_refund_no(),
             order_id=order.id,
@@ -191,8 +218,99 @@ def auto_refund_dispatch_fail(order):
             refund_amount=order.pay_amount,
             status=Refund.STATUS_REFUNDING,
         )
-        _do_refund_order(order, refund)
+    _settle_refund_to_user(order, refund)
     return refund
+
+
+def refund_by_up_ticket_refund(order):
+    """麻花已退票（ticketRefund 回调）：票款已退回我方账户，对用户原路退款。
+
+    纠纷中(90)/退款中(70) -> 退款中(70)，微信退款到账后 -> 已退款(80)
+    （真实链路由 on_refund_notify 回写迁移；骨架降级直接到账即迁移）。
+    回调可能先于我方退款单到达，退款单不存在则补建；同单已有进行中/到账的
+    同类退款单则复用（微信按 out_refund_no 幂等，不会重复打款）。
+    微信退款被拒时退款单记 FAIL 交重试任务，不向上抛异常——
+    避免麻花因回调处理失败在重推周期内无限重推。
+    """
+    if order.status == TicketOrder.STATUS_REFUNDED:
+        # 已退款：查到账退款单即认为闭环完成（幂等，防重复打款）
+        return Refund.objects.filter(
+            order_id=order.id, type=Refund.TYPE_UP_REFUND,
+        ).exclude(status=Refund.STATUS_FAIL).first()
+
+    with transaction.atomic():
+        # 复用最近一笔未到账的同类退款单（FAIL 的重置重发，微信按 out_refund_no 幂等）
+        refund = Refund.objects.filter(
+            order_id=order.id, type=Refund.TYPE_UP_REFUND,
+        ).exclude(status=Refund.STATUS_ARRIVED).order_by('-id').first()
+        if refund is None:
+            refund = Refund.objects.create(
+                refund_ext_no=gen_refund_no(),
+                order_id=order.id,
+                type=Refund.TYPE_UP_REFUND,
+                reason='麻花已退票，原路退款',
+                refund_amount=order.pay_amount,
+                status=Refund.STATUS_REFUNDING,
+            )
+        if order.status == TicketOrder.STATUS_DISPUTE:
+            transition(order, TicketOrder.STATUS_REFUNDING)
+
+    _settle_refund_to_user(order, refund)
+    return refund
+
+
+def _settle_refund_to_user(order, refund):
+    """事务外发起微信退款并收敛订单终态（供自动退款链路复用）。
+
+    - 受理成功：退款单记「退款中」，到账由 on_refund_notify 迁移订单；
+    - 骨架降级（未配置证书）：直接到账，订单迁移「已退款」+ 支付状态回冲；
+    - 被微信拒绝：退款单记 FAIL，由退款重试任务兜底，不向上抛。
+    """
+    try:
+        refund_retry_once(order, refund)
+    except Exception as exc:  # noqa: BLE001 受理失败：记 FAIL 交重试任务
+        refund.status = Refund.STATUS_FAIL
+        refund.save(update_fields=['status', 'updated_at'])
+        logger.error('微信退款发起失败（待重试） refund=%s err=%s',
+                     refund.refund_ext_no, exc)
+        return refund
+    if refund.status == Refund.STATUS_ARRIVED:
+        if order.status == TicketOrder.STATUS_REFUNDING:
+            transition(order, TicketOrder.STATUS_REFUNDED)
+        TicketOrder.objects.filter(id=order.id).update(
+            pay_status=TicketOrder.PAY_REFUNDED)
+    return refund
+
+
+# 可自动重试的退款类型：出票失败自动退 / 关单竞态退 / 上游退票退。
+# 拦截退款(1)失败是「转人工」语义，严禁自动重试；纠纷退款(2)失败由麻花重推回调驱动。
+RETRYABLE_REFUND_TYPES = (
+    Refund.TYPE_DISPATCH_FAIL, Refund.TYPE_PAY_AFTER_CLOSE, Refund.TYPE_UP_REFUND,
+)
+
+
+def retry_failed_refunds(limit=50):
+    """重试失败的微信退款（定时任务调用）：退款单 FAIL 且类型可重试 -> 重新发起。
+
+    订单状态不动（退款中/已退款由 on_refund_notify 按真实结果回写），
+    受理成功即回到「退款中」等通知到账。
+    """
+    refunds = Refund.objects.filter(
+        status=Refund.STATUS_FAIL, type__in=RETRYABLE_REFUND_TYPES,
+    ).order_by('updated_at')[:limit]
+    ok_cnt = fail_cnt = 0
+    for refund in refunds:
+        order = TicketOrder.objects.filter(id=refund.order_id).first()
+        if order is None:
+            continue
+        try:
+            with transaction.atomic():
+                refund_retry_once(order, refund)
+            ok_cnt += 1
+        except Exception as exc:  # noqa: BLE001 单笔失败不影响整批，下轮再试
+            fail_cnt += 1
+            logger.warning('退款重试失败 refund=%s err=%s', refund.refund_ext_no, exc)
+    return {'retried': len(refunds), 'ok': ok_cnt, 'fail': fail_cnt}
 
 
 # 麻花纠纷回调事件（docs/mahua-api/00-通用说明-02-回调接口纠纷.md）→ 我方动作

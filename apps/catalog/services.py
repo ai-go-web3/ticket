@@ -247,6 +247,12 @@ def _upsert_schedule(data):
         'min_price': _seat_sale_price(
             price, _markup_fen(fast_price), _markup_fen(max_speed_price)) or 0,
         'origin_price': price,
+        # 原始价快照（未上浮，分）：对账/审计用，min_price 的上浮前口径
+        'raw_price_json': {
+            'price': price,
+            'fastPrice': fast_price,
+            'maxSpeedPrice': max_speed_price,
+        },
         'snapshot_at': timezone.now(),
     }
     obj, created = Schedule.objects.update_or_create(
@@ -745,7 +751,11 @@ def pull_seats(show_id):
             c = int(s.get('columnNo'))
         except (TypeError, ValueError):
             continue
-        region = region_prices.get(str(s.get('sectionId') or '')) or default_region or (None, None, None)
+        # sectionId/area 实测两字段同值（三套供应商报文均如此），都试一遍防只填其一；
+        # 都未命中再回退默认区域（key '0' 优先，否则取第一项）
+        region = (region_prices.get(str(s.get('sectionId') or ''))
+                  or region_prices.get(str(s.get('area') or ''))
+                  or default_region or (None, None, None))
         rp, rfast, rmax = region
 
         price_fen = _parse_price(s.get('price'))
