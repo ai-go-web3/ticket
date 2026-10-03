@@ -289,17 +289,35 @@ RETRYABLE_REFUND_TYPES = (
 )
 
 
+def refund_retry_max_times():
+    """退款失败最大重试次数（settings.REFUND_RETRY_MAX_TIMES，默认 5），0 = 不限制。"""
+    from django.conf import settings as dj_settings
+    return int(getattr(dj_settings, 'REFUND_RETRY_MAX_TIMES', 5) or 0)
+
+
 def retry_failed_refunds(limit=50):
-    """重试失败的微信退款（定时任务调用）：退款单 FAIL 且类型可重试 -> 重新发起。
+    """重试失败的微信退款（内置定时器每 5 分钟扫描一次）。
+
+    退款单 FAIL 且类型可重试、重试次数未达上限（REFUND_RETRY_MAX_TIMES，默认 5）
+    -> 重新发起微信退款；每次扫描无论成败都递增 retry_count，达上限后停止自动
+    重试，退款单停留 FAIL 状态待人工处理（避免对微信接口无限重试）。
 
     订单状态不动（退款中/已退款由 on_refund_notify 按真实结果回写），
     受理成功即回到「退款中」等通知到账。
     """
-    refunds = Refund.objects.filter(
+    max_times = refund_retry_max_times()
+    qs = Refund.objects.filter(
         status=Refund.STATUS_FAIL, type__in=RETRYABLE_REFUND_TYPES,
-    ).order_by('updated_at')[:limit]
+    ).order_by('updated_at')
+    if max_times > 0:
+        qs = qs.filter(retry_count__lt=max_times)
+    refunds = qs[:limit]
+
     ok_cnt = fail_cnt = 0
     for refund in refunds:
+        # 先递增再发起：无论微信受理与否都消耗一次重试机会
+        refund.retry_count += 1
+        refund.save(update_fields=['retry_count', 'updated_at'])
         order = TicketOrder.objects.filter(id=refund.order_id).first()
         if order is None:
             continue
@@ -307,9 +325,11 @@ def retry_failed_refunds(limit=50):
             with transaction.atomic():
                 refund_retry_once(order, refund)
             ok_cnt += 1
+            logger.info('退款重试已受理 refund=%s 第%s次', refund.refund_ext_no, refund.retry_count)
         except Exception as exc:  # noqa: BLE001 单笔失败不影响整批，下轮再试
             fail_cnt += 1
-            logger.warning('退款重试失败 refund=%s err=%s', refund.refund_ext_no, exc)
+            logger.warning('退款重试失败 refund=%s 第%s/%s次 err=%s',
+                           refund.refund_ext_no, refund.retry_count, max_times, exc)
     return {'retried': len(refunds), 'ok': ok_cnt, 'fail': fail_cnt}
 
 

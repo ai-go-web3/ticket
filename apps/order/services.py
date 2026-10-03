@@ -40,6 +40,11 @@ def create_order(user_id, payload):
             raise BizError('场次不存在', code=40400)
         catalog_services.ensure_sellable(schedule)
 
+        # 座位快照校验：放单 row/col 由座位名（name，源自麻花 seatNo）正则提取，
+        # 名字缺失只能到放单时才暴露；建单即拦截并给出明确报错。
+        if any(not str(s.get('name') or '').strip() for s in seats):
+            raise BizError('座位信息缺失，请重新选座', code=40000)
+
         # 2. 计算金额（分）：不收服务费，总费 = ΣsalePrice（成本上浮后的每座售价求和）。
         #    快速模式按 maxSpeedPrice 收费、放单走极速通道，预估成本按原始 maxSpeedPrice 口径；
         #    特惠模式按 fastPrice 收费、放单默认特惠通道，预估成本按原始 fastPrice 口径。

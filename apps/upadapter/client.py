@@ -54,7 +54,15 @@ def _extract_row_col(seat_name):
 def build_dispatch_payload(order, call_back_url=None):
     """构造放单请求 body（字段映射 §4.1）。
 
-    优先用 row+col（seatId 可能变动）。
+    座位定位只用 row+col，来源链路：麻花座位接口 seatNo（"4排2座"）-> 我方座位
+    接口 name -> 前端选座带回 -> 建单 seats_json 快照 -> 此处按文档示例正则
+    [a-zA-Z0-9]+ 提取（如 "4排2座" -> row='4', col='2'，"A排5行" -> ('A','5')）。
+    不依赖前端传 row/col；快照里的 col 是 0 基画图坐标（columnNo），与放单的
+    "座"号不是一个口径，座位名缺失时宁可快速失败也绝不用坐标猜（会买错座）。
+    不传 seatId：麻花文档注意3 明确 seatId 易随渠道数据变动而失效，且同时传
+    seatId 和 row/col 时麻花优先用 seatId 校验，过期 seatId 会被拒绝
+    （实测 rtnCode=100008）。row/col 是文档推荐口径。
+
     总限价 costTotalPrice：MAHUA_COST_TOTAL_PRICE 环境变量优先（联调防损/成本护栏，
     实际成本高于该价时麻花拒绝出单）；未设置时若已有结算价快照则用作上限。
     放单时结算价通常尚未回填，等于默认不限价——生产建议配置环境变量上限。
@@ -63,15 +71,13 @@ def build_dispatch_payload(order, call_back_url=None):
 
     seats = json.loads(order.seats_json or '[]')
     buy_seats = []
-    for s in seats:
-        row, col = _extract_row_col(s.get('name', ''))
-        item = {'row': row, 'col': col}
-        # 麻花座位接口的 seatId（前端传 seatId，历史数据用 seat_id）；有则一并带上，
-        # 放单时麻花会优先用 seatId 校验，row/col 作为兜底。
-        seat_id = s.get('seatId') or s.get('seat_id')
-        if seat_id:
-            item['seatId'] = seat_id
-        buy_seats.append(item)
+    for i, s in enumerate(seats):
+        row, col = _extract_row_col(s.get('name') or '')
+        if not row or not col:
+            raise BizError(
+                f'座位快照缺失座位名，无法定位第{i + 1}个座位（order={order.order_ext_no}），'
+                '已阻止放单以防买错座')
+        buy_seats.append({'row': row, 'col': col})
 
     payload = {
         'outId': order.order_ext_no,

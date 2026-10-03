@@ -41,9 +41,11 @@ def gen_seat_map(schedule):
         seats = []
         for c in range(col_count):
             status = _seat_status(sid, r, c)
+            name = f'{r}排{c + 1}座'
             seats.append({
                 'col': c,
-                'name': f'{r}排{c + 1}座',
+                'name': name,
+                'seatNo': name,   # 与真实接口契约一致（兜底图座位名即原始座位名）
                 'status': status,
                 'price': price,
             })

@@ -171,6 +171,9 @@ DISPATCH_SYNC_SECONDS = int(os.environ.get('DISPATCH_SYNC_SECONDS', '60'))
 DISPATCH_STALE_SECONDS = int(os.environ.get('DISPATCH_STALE_SECONDS', '180'))
 # 失败微信退款重试间隔（秒）。0 = 关闭该定时任务（退款单停 FAIL 待人工）。
 REFUND_RETRY_SECONDS = int(os.environ.get('REFUND_RETRY_SECONDS', '300'))
+# 退款失败最大自动重试次数（默认 5，每 5 分钟一次即最多重试 25 分钟）。
+# 超过后退款单停留 FAIL 待人工处理。0 = 不限制重试次数。
+REFUND_RETRY_MAX_TIMES = int(os.environ.get('REFUND_RETRY_MAX_TIMES', '5'))
 
 # 真实支付联调开关：强制所有订单实付金额（分）。
 # 设 PAY_AMOUNT_OVERRIDE_FEN=1 即 0.01 元走真实微信支付/放单全链路，避免联调期

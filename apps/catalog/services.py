@@ -730,6 +730,19 @@ def pull_seats(show_id):
         无则上浮后 maxSpeedPrice，再无原价）；fastPrice/maxSpeedPrice 为已上浮值，
         前端确认页双模式计价直接使用，全链路同一口径。
 
+    麻花 movieFilmSeatData 字段 ↔ 我方座位字段（严格一一对应）：
+        rowNo     -> row      仅画图分组（文档：勿用作下单，与座位排不一定对应）
+        columnNo  -> col      仅画图排序（同上）
+        seatNo    -> name     座位名展示；放单 row/col 由此名正则提取
+        status    -> status   N->0 可售 / LK->1 已售 / E->3 不可售
+        seatId    -> seatId   透传给前端做建单快照；放单不传（易变动，用 row/col）
+        price     -> price    票面原价（分），缺失回退区域价
+        fastPrice -> fastPrice        上浮后下发（分），缺失回退区域价
+        maxSpeedPrice -> maxSpeedPrice 同上
+        lovestatus/area -> 同名透出
+        sectionId -> （不透出）仅用于 movieFilmSeatPrices 区域取价回退
+    兜底图（gen_seat_map）无 seatId 字段，前端 data-id 为空、放单只用 row/col。
+
     取价口径：座位级 fastPrice/maxSpeedPrice 真实报文常缺失（示例仅返回 price），
     缺失时按 seat.sectionId 回退 movieFilmSeatPrices 区域价格表，再回退默认区域；
     原价同理（座位 price 缺失用区域价）。
@@ -772,7 +785,8 @@ def pull_seats(show_id):
         seat = {
             'col': c,
             'name': s.get('seatNo'),                 # 展示 + 放单 row/col 从此名解析
-            'seatId': s.get('seatId'),               # 放单主用此参数
+            'seatNo': s.get('seatNo'),               # 麻花原始座位名（对账/排查用，与 name 同源）
+            'seatId': s.get('seatId'),               # 建单快照透传；放单不用（易变动）
             'status': _MAHUA_SEAT_STATUS.get(s.get('status'), 3),
             'price': price_fen,
             'salePrice': _seat_sale_price(price_fen, fast_fen, max_speed_fen),

@@ -13,6 +13,7 @@ class OrderSerializer(serializers.ModelSerializer):
     statusText = serializers.SerializerMethodField()
     statusColor = serializers.SerializerMethodField()
     payRemainSeconds = serializers.SerializerMethodField()
+    upDispatchNo = serializers.SerializerMethodField()
 
     class Meta:
         model = TicketOrder
@@ -20,7 +21,7 @@ class OrderSerializer(serializers.ModelSerializer):
                   'seats', 'seat_count', 'ticket_amount', 'service_fee',
                   'discount_amount', 'pay_amount', 'settle_amount', 'mobile',
                   'status', 'statusText', 'statusColor', 'pay_status',
-                  'payRemainSeconds',
+                  'payRemainSeconds', 'upDispatchNo',
                   'movieName', 'poster', 'cinemaName', 'showTime', 'created_at']
 
     _STATUS_TEXT = {
@@ -34,6 +35,17 @@ class OrderSerializer(serializers.ModelSerializer):
         TicketOrder.STATUS_REFUNDED: '已退款',
         TicketOrder.STATUS_DISPUTE: '纠纷中',
     }
+
+    def get_upDispatchNo(self, obj):
+        """三方（麻花）放单号，便于追溯/对账；未放单或被拒（无单号）返回空串。"""
+        cache = self.context.setdefault('_dispatch_cache', {})
+        if obj.id not in cache:
+            from apps.order.models import MahuaDispatch
+            no = MahuaDispatch.objects.filter(
+                order_ext_no=obj.order_ext_no,
+            ).values_list('mahua_order_no', flat=True).first()
+            cache[obj.id] = no or ''
+        return cache[obj.id]
 
     def get_seats(self, obj):
         import json

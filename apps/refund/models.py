@@ -26,6 +26,7 @@ class Refund(models.Model):
     mahua_refund_no = models.CharField(max_length=64, null=True, verbose_name='麻花退款号')
     wx_refund_no = models.CharField(max_length=64, null=True, verbose_name='微信退款号')
     status = models.SmallIntegerField(verbose_name='状态')
+    retry_count = models.IntegerField(default=0, verbose_name='微信退款重试次数')
     version = models.IntegerField(default=0, verbose_name='乐观锁')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')

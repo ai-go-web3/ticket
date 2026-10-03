@@ -210,7 +210,10 @@ def wx_refund(order, refund):
     cert, key = cfg.get('MCH_CERT_PATH') or '', cfg.get('MCH_KEY_PATH') or ''
     real_refund = bool(cert and key)
     if not real_refund:
+        # 骨架降级：不发起请求（/secapi/pay/refund 是双向证书接口，无证书请求
+        # 会被微信拒绝并返回非 XML 报文，解析报 mismatched tag），直接视为受理成功。
         logger.warning('商户API证书未配置，退款降级为骨架标记 refund=%s', refund.refund_ext_no)
+        return True, None
 
     if refund.refund_amount <= 0:
         raise BizError('退款金额非法')
