@@ -19,12 +19,31 @@ import logging
 from datetime import datetime
 
 from django.conf import settings
+from django.db import close_old_connections
 
 logger = logging.getLogger('app')
 
 _scheduler = None
 
 
+def _job(fn):
+    """定时任务装饰器：执行前后清理失效的 DB 连接。
+
+    APScheduler 与 gunicorn worker 同进程常驻，MySQL 长连接空闲超过服务端
+    wait_timeout 后会被服务端断开，下次任务一执行就报
+    pymysql InterfaceError(0, '')。close_old_connections() 会关闭失效连接，
+    让 Django 在下次查询时自动重建。
+    """
+    def wrapper(*args, **kwargs):
+        close_old_connections()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            close_old_connections()
+    return wrapper
+
+
+@_job
 def _run_token_job():
     """APScheduler 回调：刷新麻花 token（带锁去重，多副本只一个真正登录）。"""
     from apps.upadapter.token import scheduled_refresh
@@ -35,6 +54,7 @@ def _run_token_job():
         logger.error('内置麻花 token 刷新任务失败（无可用 token）')
 
 
+@_job
 def _run_close_expired_job():
     """APScheduler 回调：关闭超时未付款订单。"""
     from apps.order.services import close_expired_orders
@@ -43,6 +63,7 @@ def _run_close_expired_job():
         logger.info('超时未付款订单自动关闭：%s 单', closed)
 
 
+@_job
 def _run_coming_pull_job():
     """APScheduler 回调：全量拉取待映影片（分页循环到拉空，上限 100 条）。"""
     from apps.catalog.services import run_coming_pull
@@ -53,6 +74,7 @@ def _run_coming_pull_job():
     )
 
 
+@_job
 def _run_dispatch_compensation_job():
     """APScheduler 回调：放单补偿（待补偿单重放/查询收敛 + 出票中超时查询兜底）。"""
     from apps.upadapter.client import compensate_dispatches
@@ -61,6 +83,7 @@ def _run_dispatch_compensation_job():
         logger.info('放单补偿任务：%s', res)
 
 
+@_job
 def _run_refund_retry_job():
     """APScheduler 回调：失败微信退款重试。"""
     from apps.refund.services import retry_failed_refunds
