@@ -46,7 +46,7 @@ def create_order(user_id, payload):
             raise BizError('座位信息缺失，请重新选座', code=40000)
 
         # 2. 计算金额（分）：不收服务费，总费 = ΣsalePrice（成本上浮后的每座售价求和）。
-        #    快速模式按 maxSpeedPrice 收费、放单走极速通道，预估成本按原始 maxSpeedPrice 口径；
+        #    快速模式按 maxSpeedPrice 收费、放单走快速通道（model=1），预估成本按原始 maxSpeedPrice 口径；
         #    特惠模式按 fastPrice 收费、放单默认特惠通道，预估成本按原始 fastPrice 口径。
         from django.conf import settings as dj_settings
         rate = float(getattr(dj_settings, 'PRICE_MARKUP_RATE', 0.05) or 0)
@@ -63,6 +63,9 @@ def create_order(user_id, payload):
         est_max = 0
         for s in seats:
             sale = int(s.get('salePrice') or s['price'])
+            # 售价不得高于原价：防前端异常/数据缺失造成反向计价
+            if int(s.get('price') or 0) > 0:
+                sale = min(sale, int(s['price']))
             ticket_amount += sale
             fast = int(s.get('fastPrice') or 0)
             if fast > 0:

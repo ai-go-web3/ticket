@@ -17,6 +17,7 @@
 到账结果以微信退款结果通知（on_refund_notify）回写为准并做订单状态对账。
 """
 import logging
+from datetime import timedelta
 
 from django.db import transaction
 
@@ -295,6 +296,57 @@ def _settle_refund_to_user(order, refund):
 RETRYABLE_REFUND_TYPES = (
     Refund.TYPE_DISPATCH_FAIL, Refund.TYPE_PAY_AFTER_CLOSE, Refund.TYPE_UP_REFUND,
 )
+
+
+def reconcile_refunding_refunds(limit=100, grace_seconds=60):
+    """退款中对账兜底（内置定时器调用）：主动查微信退款结果并收敛订单。
+
+    退款到账依赖微信退款结果通知（/pay/refund-notify）回写；通知丢失/推送
+    失败时订单会停留「退款中(70)」而钱实际已到账。此任务对「退款中」的退款单
+    调微信「查询退款」接口（/secapi/pay/refundquery）对账：
+        SUCCESS / CHANGE      -> 到账：退款单记已到账，订单 -> 已退款(80)；
+        FAIL / REFUNDCLOSE    -> 失败：退款单记 FAIL，交退款重试任务重发；
+        PROCESSING / 查询失败  -> 跳过，等下一轮。
+    受理后 grace_seconds 内的新退款单跳过，给通知回写留时间，减少无谓查询。
+    幂等：与退款通知共用 _reconcile_order_on_refund，重复收敛无副作用。
+    """
+    from django.utils import timezone
+    from apps.pay.services import wx_refund_query, _reconcile_order_on_refund
+
+    deadline = timezone.now() - timedelta(seconds=grace_seconds)
+    refunds = Refund.objects.filter(
+        status=Refund.STATUS_REFUNDING, updated_at__lt=deadline,
+    ).order_by('updated_at')[:limit]
+
+    res = {'refunding': 0, 'arrived': 0, 'failed': 0, 'processing': 0}
+    for refund in refunds:
+        res['refunding'] += 1
+        order = TicketOrder.objects.filter(id=refund.order_id).first()
+        if not order:
+            continue
+        try:
+            status = wx_refund_query(order, refund)
+        except Exception as exc:  # noqa: BLE001 单笔异常不影响整批
+            logger.warning('退款对账查询异常 refund=%s err=%s', refund.refund_ext_no, exc)
+            continue
+        if not status:
+            continue
+        if status in ('SUCCESS', 'CHANGE'):
+            refund.status = Refund.STATUS_ARRIVED
+            refund.save(update_fields=['status', 'updated_at'])
+            _reconcile_order_on_refund(refund, arrived=True)
+            logger.info('退款对账：已到账（通知未回写的兜底收敛） refund=%s', refund.refund_ext_no)
+            res['arrived'] += 1
+        elif status in ('FAIL', 'REFUNDCLOSE'):
+            refund.status = Refund.STATUS_FAIL
+            refund.save(update_fields=['status', 'updated_at'])
+            _reconcile_order_on_refund(refund, arrived=False)
+            logger.warning('退款对账：微信退款失败 refund=%s status=%s',
+                           refund.refund_ext_no, status)
+            res['failed'] += 1
+        else:
+            res['processing'] += 1
+    return res
 
 
 def refund_retry_max_times():

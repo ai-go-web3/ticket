@@ -193,6 +193,7 @@ def _verify_sign(params, key):
 # ===== 微信退款（放单失败/回调失败场景的用户回款） =====
 
 REFUND_API = 'https://api.mch.weixin.qq.com/secapi/pay/refund'
+REFUND_QUERY_API = 'https://api.mch.weixin.qq.com/secapi/pay/refundquery'
 
 
 def wx_refund(order, refund):
@@ -252,6 +253,46 @@ def wx_refund(order, refund):
     logger.info('微信退款已受理 refund=%s wx_refund_no=%s 金额=%s分',
                 refund.refund_ext_no, wx_refund_no, refund.refund_amount)
     return True, wx_refund_no
+
+
+def wx_refund_query(order, refund):
+    """查询微信退款结果（v2 /secapi/pay/refundquery，双向证书）——退款对账兜底用。
+
+    返回该笔退款的状态字符串（微信枚举）：SUCCESS/CHANGE(退款异常退回用户卡，
+    视为到账)/FAIL/REFUNDCLOSE(失败，可重发)/PROCESSING(处理中)。
+    未配置商户证书/PAY_KEY（骨架降级环境）返回 None：此时退款受理即到账，
+    无需对账。
+    """
+    cfg = settings.WECHAT
+    cert = cfg.get('MCH_CERT_PATH') or ''
+    key = cfg.get('MCH_KEY_PATH') or ''
+    if not (cfg.get('MCHID') and cfg.get('PAY_KEY') and cert and key):
+        return None
+
+    params = {
+        'appid': cfg['APPID'],
+        'mch_id': cfg['MCHID'],
+        'nonce_str': uuid.uuid4().hex,
+        'out_refund_no': refund.refund_ext_no,
+        'op_user_id': cfg['MCHID'],
+    }
+    params['sign'] = _sign(params, cfg['PAY_KEY'])
+    resp = requests.post(
+        REFUND_QUERY_API, data=_dict_to_xml(params).encode(),
+        cert=(cert, key), timeout=15,
+    )
+    result = _xml_to_dict(resp.text)
+    if result.get('return_code') != 'SUCCESS' or result.get('result_code') != 'SUCCESS':
+        logger.error('微信退款查询失败 refund=%s result=%s', refund.refund_ext_no, result)
+        return None
+    # 同单可能多笔退款，返回字段带 _N 下标；按退款单号定位本笔
+    count = int(result.get('refund_count_0') or 1)
+    for i in range(count):
+        if result.get(f'out_refund_no_{i}') == refund.refund_ext_no:
+            return result.get(f'refund_status_{i}')
+    logger.error('微信退款查询未定位到本笔退款 refund=%s result=%s',
+                 refund.refund_ext_no, result)
+    return None
 
 
 def _decrypt_req_info(req_info_b64, pay_key):

@@ -818,6 +818,10 @@ def pull_seats(show_id):
         max_speed_fen = _markup_fen(_parse_price(s.get('maxSpeedPrice')))
         if max_speed_fen is None:
             max_speed_fen = _markup_fen(rmax)
+        # 上浮后售价不得高于原价，避免「原价-售价」出现反向优惠
+        if price_fen and price_fen > 0:
+            fast_fen = min(fast_fen, price_fen) if fast_fen else fast_fen
+            max_speed_fen = min(max_speed_fen, price_fen) if max_speed_fen else max_speed_fen
         seat = {
             'col': c,
             'name': s.get('seatNo'),                 # 展示 + 放单 row/col 从此名解析

@@ -102,6 +102,15 @@ def _run_refund_retry_job():
         logger.info('退款重试任务：%s', res)
 
 
+@_job
+def _run_refund_reconcile_job():
+    """APScheduler 回调：退款中对账（主动查微信退款结果，通知丢失的兜底收敛）。"""
+    from apps.refund.services import reconcile_refunding_refunds
+    res = reconcile_refunding_refunds()
+    if res.get('refunding'):
+        logger.info('退款对账任务：%s', res)
+
+
 def _token_refresh_minutes():
     """从 settings.MAHUA['TOKEN_REFRESH']（秒）取刷新间隔分钟，<=0 表示不启用。"""
     try:
@@ -203,6 +212,17 @@ def start():
         )
         added += 1
 
+    # 退款中对账：主动查微信退款结果收敛「退款中」订单（通知丢失的兜底，
+    # 每 2 分钟一轮；REFUND_RECONCILE_SECONDS 可调，<=0 关闭）
+    refund_reconcile_seconds = _int_setting('REFUND_RECONCILE_SECONDS', 120)
+    if refund_reconcile_seconds > 0:
+        sched.add_job(
+            _run_refund_reconcile_job, IntervalTrigger(seconds=refund_reconcile_seconds),
+            id='refund_reconcile', name='refund_reconcile',
+            replace_existing=True, coalesce=True, misfire_grace_time=300,
+        )
+        added += 1
+
     if added == 0:
         logger.warning('无任何定时任务需要注册，调度器未启动')
         return None
@@ -211,12 +231,14 @@ def start():
     _scheduler = sched
     logger.info(
         '内置定时器已启动：token_refresh=%smin coming_pull=%smin '
-        'dispatch_compensation=%ss dispatch_query=%ss refund_retry=%ss tz=%s',
+        'dispatch_compensation=%ss dispatch_query=%ss refund_retry=%ss '
+        'refund_reconcile=%ss tz=%s',
         refresh_min if mahua_configured else 'off',
         coming_min if mahua_configured else 'off',
         dispatch_sync_seconds if mahua_configured else 'off',
         dispatch_query_seconds if mahua_configured else 'off',
         refund_retry_seconds,
+        refund_reconcile_seconds,
         tz,
     )
     return sched

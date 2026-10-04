@@ -27,7 +27,7 @@ class CreateOrderSerializer(serializers.Serializer):
     seats = serializers.ListField(child=serializers.DictField())
     mobile = serializers.CharField(required=False, allow_blank=True)
     discountAmount = serializers.IntegerField(required=False, default=0)
-    # 购票方式：tehui 特惠（放单不传 model）/ kuai 快速（放单 model=2 极速通道）
+    # 购票方式：tehui 特惠（放单不传 model）/ kuai 快速（放单 model=1 快速通道）
     buyMode = serializers.CharField(required=False, default='tehui')
 
 

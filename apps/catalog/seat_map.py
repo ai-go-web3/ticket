@@ -15,6 +15,8 @@
 """
 import hashlib
 
+from django.conf import settings
+
 
 def _seeded_int(schedule_id, salt):
     """基于 schedule_id 生成稳定的伪随机整数。"""
@@ -22,15 +24,40 @@ def _seeded_int(schedule_id, salt):
     return int(h[:8], 16)
 
 
+def _markup_fen(fen):
+    """成本价(分)按 PRICE_MARKUP_RATE 上浮（与 catalog.services._markup_fen 同口径）。"""
+    if not fen or fen <= 0:
+        return fen
+    rate = float(getattr(settings, 'PRICE_MARKUP_RATE', 0.05) or 0)
+    return int(round(fen * (1 + rate)))
+
+
+def _schedule_prices(schedule):
+    """座位三价（分）：(price 原价, fastPrice 上浮后, maxSpeedPrice 上浮后)。
+
+    麻花快照 raw_price_json={price, fastPrice, maxSpeedPrice}（未上浮成本口径）
+    优先，成本价上浮后下发；fastPrice/maxSpeedPrice 缺失（或无快照）时直接使用
+    原价——三价同值，即无优惠，不虚构折扣。
+    """
+    raw = schedule.raw_price_json or {}
+    price = raw.get('price') or schedule.min_price or 4500
+    fast = _markup_fen(raw['fastPrice']) if raw.get('fastPrice') else price
+    max_speed = _markup_fen(raw['maxSpeedPrice']) if raw.get('maxSpeedPrice') else price
+    # 上浮后售价不得高于原价，避免「原价-售价」出现反向优惠
+    return price, min(fast, price), min(max_speed, price)
+
+
 def gen_seat_map(schedule):
     """生成场次座位图。
 
     Returns:
         (rows, hall_name, price)
-        rows: [{ 'row': int, 'seats': [{col,name,status,price}, ...] }]
+        rows: [{ 'row': int, 'seats': [{col,name,status,price,fastPrice,maxSpeedPrice}, ...] }]
+        三价口径与真实麻花座位接口一致（fastPrice/maxSpeedPrice 为已上浮值，分），
+        前端确认页双模式计价两种链路同一口径。
     """
     sid = schedule.id
-    price = schedule.min_price or 4500  # 最低价兜底 45 元
+    price, fast_price, max_speed_price = _schedule_prices(schedule)
 
     # 影厅规模：8~12 排，每排 8~12 座（由 schedule_id 稳定决定）
     row_count = 8 + _seeded_int(sid, 'row') % 5       # 8~12
@@ -48,6 +75,8 @@ def gen_seat_map(schedule):
                 'seatNo': name,   # 与真实接口契约一致（兜底图座位名即原始座位名）
                 'status': status,
                 'price': price,
+                'fastPrice': fast_price,          # 快速出票价（分，已上浮）
+                'maxSpeedPrice': max_speed_price, # 极速/更深优惠价（分，已上浮）
             })
         rows.append({'row': r, 'seats': seats})
 
