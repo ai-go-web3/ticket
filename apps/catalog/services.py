@@ -381,6 +381,42 @@ def pull_regions(mahua_city_id, date=None, up_movie_id=None, ttl=300):
     return regions
 
 
+def pull_brands(mahua_city_id, date=None, up_movie_id=None, ttl=300):
+    """实时拉取某城市的影院品牌列表（「品牌▾」筛选项）。
+
+    mahua_city_id：麻花 cityId（成都=8）。date 选填（不传即全市品牌）；
+    up_movie_id：麻花影片ID，传则收敛为「有该片排片的品牌」。
+    过滤 brandName 为空的脏数据，返回 [{'name', 'count'}]，按影院数降序。
+
+    与 pull_regions 同款短 TTL 缓存（默认 300s）按 city+date+film 维度去重。
+    """
+    key = 'mahua:brands:%s:%s:%s' % (mahua_city_id, date or '-', up_movie_id or '-')
+    try:
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+    except Exception:  # noqa: BLE001 - 缓存不可用时降级直连
+        pass
+
+    client, token = _mahua()
+    code, data = client.get_cinema_brands(token, mahua_city_id, date=date, film_id=up_movie_id)
+    rows = data if isinstance(data, list) else (data or {}).get('list') or []
+    brands = []
+    for r in rows:
+        name = r.get('brandName')
+        if not name:
+            continue  # 过滤 brandName 为空的脏数据
+        brands.append({'name': name, 'count': r.get('num', 0)})
+    brands.sort(key=lambda x: (-x['count'], x['name']))
+    logger.info('实时拉品牌 city=%s film=%s date=%s 命中 %s', mahua_city_id, up_movie_id, date, len(brands))
+    if brands:  # 仅缓存非空结果，避免把偶发空集固化
+        try:
+            cache.set(key, brands, ttl)
+        except Exception:  # noqa: BLE001
+            pass
+    return brands
+
+
 # ---------------------------------------------------------------------------
 # 影片按需拉取（读写穿透）：热映 movieOnInfoList(ci=城市)，待映 comingList(全国分页)。
 # 缓存 TTL 内直接读本地库；麻花失败降级返回本地已有数据。替代原每日定时同步。

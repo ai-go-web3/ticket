@@ -128,6 +128,18 @@ class MahuaClient:
             body['filmId'] = film_id
         return self._post('/api/movie-server/movie/info/filterCinemas/region', body, token=token)
 
+    def get_cinema_brands(self, token, city_id, date=None, film_id=None):
+        """影院品牌数量（「品牌▾」筛选项）。ci 必填，date/film_id 选填。
+
+        返回 rtnData 为 [{brandName, num}] 列表；传 film_id 则收敛为「有该片排片的品牌」。
+        """
+        body = {'ci': int(city_id)}
+        if date:
+            body['date'] = date
+        if film_id is not None:
+            body['filmId'] = film_id
+        return self._post('/api/movie-server/movie/info/filterCinemas/brand', body, token=token)
+
     def get_cinema_detail(self, token, cinema_id):
         """影院详情。"""
         return self._post('/api/movie-server/movie/info/cinemaInfo', {'cinemaId': cinema_id}, token=token)

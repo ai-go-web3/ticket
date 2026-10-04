@@ -124,6 +124,15 @@ REST_FRAMEWORK = {
 }
 
 # 微信小程序配置
+def _resolve_path(p):
+    """把证书路径解析为绝对路径：空值原样返回；已是绝对路径或含 ~ 则原样；
+    相对路径拼到 BASE_DIR 下，避免依赖进程工作目录。"""
+    if not p:
+        return p
+    if os.path.isabs(p) or p.startswith('~'):
+        return p
+    return str(BASE_DIR / p)
+
 WECHAT = {
     'APPID': os.environ.get('WX_APPID', ''),
     'SECRET': os.environ.get('WX_SECRET', ''),
@@ -136,8 +145,9 @@ WECHAT = {
     # apiclient_cert.pem / apiclient_key.pem 两个 PEM 文件路径（从商户平台下载的
     # 证书包解出，或用 openssl 从 apiclient_cert.p12 导出）。
     # 两者任一缺失 -> 退款降级为骨架标记（不真打款，联调环境用）。
-    'MCH_CERT_PATH': os.environ.get('WX_MCH_CERT_PATH', ''),
-    'MCH_KEY_PATH': os.environ.get('WX_MCH_KEY_PATH', ''),
+    # 相对路径统一解析为相对 BASE_DIR 的绝对路径，避免依赖进程工作目录。
+    'MCH_CERT_PATH': _resolve_path(os.environ.get('WX_MCH_CERT_PATH', '')),
+    'MCH_KEY_PATH': _resolve_path(os.environ.get('WX_MCH_KEY_PATH', '')),
     # 退款结果通知地址（微信异步推送退款到账结果，AES 加密）
     'REFUND_NOTIFY_URL': os.environ.get('WX_REFUND_NOTIFY_URL', ''),
 }

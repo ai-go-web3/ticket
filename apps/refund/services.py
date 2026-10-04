@@ -302,8 +302,9 @@ def retry_failed_refunds(limit=50):
     -> 重新发起微信退款；每次扫描无论成败都递增 retry_count，达上限后停止自动
     重试，退款单停留 FAIL 状态待人工处理（避免对微信接口无限重试）。
 
-    订单状态不动（退款中/已退款由 on_refund_notify 按真实结果回写），
-    受理成功即回到「退款中」等通知到账。
+    受理成功即回到「退款中」等通知到账；骨架降级（未配置证书）受理即到账，
+    此时微信不会发退款结果通知，需在此主动收敛订单到「已退款」，否则订单
+    会永久卡在「退款中(70)」。
     """
     max_times = refund_retry_max_times()
     qs = Refund.objects.filter(
@@ -324,6 +325,12 @@ def retry_failed_refunds(limit=50):
         try:
             with transaction.atomic():
                 refund_retry_once(order, refund)
+            # 骨架降级（未配置证书）受理即到账，微信不发退款结果通知，
+            # 主动收敛订单到「已退款」；真实链路退款单仍在「退款中」，
+            # 到账由 on_refund_notify 回写（此处 arrived=False 不会误迁）。
+            if refund.status == Refund.STATUS_ARRIVED:
+                from apps.pay.services import _reconcile_order_on_refund
+                _reconcile_order_on_refund(refund, arrived=True)
             ok_cnt += 1
             logger.info('退款重试已受理 refund=%s 第%s次', refund.refund_ext_no, refund.retry_count)
         except Exception as exc:  # noqa: BLE001 单笔失败不影响整批，下轮再试

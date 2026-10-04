@@ -68,14 +68,21 @@ class CinemaSerializer(serializers.ModelSerializer):
     area = serializers.CharField(source='region', read_only=True)
     # 距离（米，整数）；由视图根据用户经纬度注入到实例的 _distance，未定位则为 null
     distance = serializers.SerializerMethodField()
+    # 是否支持退票：麻花列表体 refundStatus（权威口径，视图注入 _refundable）；
+    # 回退本地库数据时为 null（本地无该字段镜像）
+    refundable = serializers.SerializerMethodField()
 
     class Meta:
         model = Cinema
         fields = ['id', 'name', 'city_code', 'region', 'area', 'brand', 'address',
-                  'lng', 'lat', 'phone', 'supports', 'business_status', 'distance']
+                  'lng', 'lat', 'phone', 'supports', 'business_status', 'distance',
+                  'refundable']
 
     def get_distance(self, obj):
         return getattr(obj, '_distance', None)
+
+    def get_refundable(self, obj):
+        return getattr(obj, '_refundable', None)
 
 
 class ScheduleSerializer(serializers.ModelSerializer):
