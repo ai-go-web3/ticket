@@ -20,29 +20,24 @@ if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
     echo "[entrypoint] REQUESTS_CA_BUNDLE -> /etc/ssl/certs/ca-certificates.crt"
 fi
 
-# 3) 微信商户 API 证书落盘（私钥严禁入库/进镜像，通过云托管环境变量注入）。
-#    容器文件系统是临时的，重启即还原；这里在每次启动时把环境变量中的 PEM
-#    内容写回文件，保证退款双向 TLS 证书在任意重启/扩缩容后始终可用。
-#    约定：WX_MCH_CERT_PEM / WX_MCH_KEY_PEM 存完整 PEM 文本；路径可由
-#    WX_MCH_CERT_PATH / WX_MCH_KEY_PATH 指定（默认 /app/certs/ 下）。
-CERT_DIR="$(dirname "${WX_MCH_CERT_PATH:-/app/certs/apiclient_cert.pem}")"
-CERT_FILE="${WX_MCH_CERT_PATH:-/app/certs/apiclient_cert.pem}"
-KEY_FILE="${WX_MCH_KEY_PATH:-/app/certs/apiclient_key.pem}"
-mkdir -p "$CERT_DIR"
-
-# printf '%b' 同时兼容「真实换行」与「字面 \n」两种环境变量写法（PEM 内容不含反斜杠，安全）。
-if [ -n "$WX_MCH_CERT_PEM" ] && [ ! -f "$CERT_FILE" ]; then
-    printf '%b\n' "$WX_MCH_CERT_PEM" > "$CERT_FILE"
-    chmod 644 "$CERT_FILE"
-    echo "[entrypoint] 已落盘商户证书 -> $CERT_FILE"
+# 3) 微信商户 API 证书从对象存储（COS）拉取（私钥严禁入库/进镜像）。
+#    容器文件系统是临时的，重启/扩缩容即还原；这里在每次启动时通过
+#    开放接口服务获取临时密钥，从对象存储下载证书到本地并做 openssl 自检。
+#    证书已上传到云托管「对象存储」，对象键与地域/桶名由环境变量指定：
+#    WX_COS_REGION / WX_COS_BUCKET / WX_COS_CERT_KEY / WX_COS_KEY_KEY
+#    落地路径沿用 WX_MCH_CERT_PATH / WX_MCH_KEY_PATH（默认 /app/certs/）。
+#    拉取或校验失败会 exit 1（fail-fast），避免静默降级把问题留到线上退款。
+if [ -n "$WX_COS_BUCKET" ] && [ -n "$WX_COS_REGION" ]; then
+    echo "[entrypoint] 从对象存储拉取微信商户 API 证书"
+    python /app/scripts/fetch_certs.py
+    CERT_FILE="${WX_MCH_CERT_PATH:-/app/certs/apiclient_cert.pem}"
+    KEY_FILE="${WX_MCH_KEY_PATH:-/app/certs/apiclient_key.pem}"
+    # 回写环境变量为绝对路径，确保 Django settings 读到正确位置。
+    export WX_MCH_CERT_PATH="$CERT_FILE"
+    export WX_MCH_KEY_PATH="$KEY_FILE"
+else
+    echo "[entrypoint] 未配置对象存储证书源（WX_COS_BUCKET/WX_COS_REGION），"
+    echo "[entrypoint] 跳过证书拉取；若退款需真实打款，请补齐相关环境变量。"
 fi
-if [ -n "$WX_MCH_KEY_PEM" ] && [ ! -f "$KEY_FILE" ]; then
-    printf '%b\n' "$WX_MCH_KEY_PEM" > "$KEY_FILE"
-    chmod 600 "$KEY_FILE"
-    echo "[entrypoint] 已落盘商户私钥 -> $KEY_FILE"
-fi
-# 落盘后回写环境变量为绝对路径，确保 Django settings 读到正确位置。
-export WX_MCH_CERT_PATH="$CERT_FILE"
-export WX_MCH_KEY_PATH="$KEY_FILE"
 
 exec "$@"

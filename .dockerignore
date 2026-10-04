@@ -31,4 +31,6 @@ logs/
 # ==== 开发文档（可选，减小镜像体积）====
 *.md
 docs/
-scripts/
+# 开发/联调用脚本不进镜像，但 fetch_certs.py（启动时从对象存储拉证书）必须保留。
+scripts/*
+!scripts/fetch_certs.py
