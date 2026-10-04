@@ -174,11 +174,12 @@ MAHUA = {
 # 订单/锁座时长（秒）
 PAY_TIMEOUT = int(os.environ.get('PAY_TIMEOUT', '900'))        # 支付 15 分钟
 
-# 放单补偿轮询间隔（秒）：STATUS_PENDING 查询/重放收敛 + 出票中超时主动查询。
+# 放单补偿轮询间隔（秒）：STATUS_PENDING 查询/重放收敛。
 # 0 = 关闭该定时任务（仍可用外部定时器调用 compensate_dispatches 替代）。
 DISPATCH_SYNC_SECONDS = int(os.environ.get('DISPATCH_SYNC_SECONDS', '60'))
-# 出票中订单视为「回调丢失」需主动查询的阈值（秒），须大于麻花正常出票耗时
-DISPATCH_STALE_SECONDS = int(os.environ.get('DISPATCH_STALE_SECONDS', '180'))
+# 出票轮询间隔（秒）：每 2 分钟全量查询「出票中」订单收敛放单结果。
+# 0 = 关闭该定时任务。
+DISPATCH_QUERY_SECONDS = int(os.environ.get('DISPATCH_QUERY_SECONDS', '120'))
 # 失败微信退款重试间隔（秒）。0 = 关闭该定时任务（退款单停 FAIL 待人工）。
 REFUND_RETRY_SECONDS = int(os.environ.get('REFUND_RETRY_SECONDS', '300'))
 # 退款失败最大自动重试次数（默认 5，每 5 分钟一次即最多重试 25 分钟）。

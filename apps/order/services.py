@@ -122,8 +122,9 @@ def mark_paid(order_id, pay_no, amount, callback_raw=None):
     （_refund_after_close），退款发起失败由退款重试任务兜底。
 
     放单请求超时/返回异常时不能回滚整个事务（微信侧已扣款）：
-    dispatch() 内部吞掉异常并把放单订单记为「待补偿(6)」，由补偿任务
-    （compensate_dispatches）按文档用查询接口收敛。
+    dispatch() 内部即时收敛——等 20s 后查询确认受理状态（有单则等麻花回调），
+    查无此单当场重放一次；重放仍失败则订单转「出票失败」并自动退款，
+    不做多轮补偿重试。
     """
     from apps.order.statemachine import transition
 
@@ -163,11 +164,11 @@ def mark_paid(order_id, pay_no, amount, callback_raw=None):
             from apps.upadapter.client import dispatch
             dispatched, mahua_no = dispatch(order.order_ext_no)
         except Exception as exc:  # noqa: BLE001 兜底：不因放单异常回滚支付落库
-            logger.error('放单事务内异常（待补偿） order=%s err=%s', order.order_ext_no, exc)
+            logger.error('放单事务内异常 order=%s err=%s', order.order_ext_no, exc)
         else:
-            if not dispatched:
+            if not dispatched and mahua_no != 'DRY-RUN':
                 logger.warning(
-                    '放单未完成（待补偿重试） order=%s mahua_no=%s',
+                    '放单未完成（已即时收敛：重放一次，仍失败已转出票失败退款） order=%s mahua_no=%s',
                     order.order_ext_no, mahua_no)
     return order
 

@@ -76,11 +76,21 @@ def _run_coming_pull_job():
 
 @_job
 def _run_dispatch_compensation_job():
-    """APScheduler 回调：放单补偿（待补偿单重放/查询收敛 + 出票中超时查询兜底）。"""
+    """APScheduler 回调：放单补偿（待补偿单重放/查询收敛）。"""
     from apps.upadapter.client import compensate_dispatches
     res = compensate_dispatches()
     if any(res.values()):
         logger.info('放单补偿任务：%s', res)
+
+
+@_job
+def _run_dispatch_query_job():
+    """APScheduler 回调：每 2 分钟轮询「出票中」订单，调 /put/query（我方单号）
+    收敛出票状态；与回调共用收敛方法，幂等不重复退款。"""
+    from apps.upadapter.client import query_dispatching_orders
+    res = query_dispatching_orders()
+    if res.get('queried'):
+        logger.info('出票轮询任务：%s', res)
 
 
 @_job
@@ -160,13 +170,25 @@ def start():
     elif coming_min > 0 and not mahua_configured:
         logger.warning('麻花 BASE_URL 未配置，跳过待映拉取定时器')
 
-    # 放单补偿：STATUS_PENDING 重放/查询收敛 + 出票中超时查询兜底（依赖麻花，要求已配置）
+    # 放单补偿：STATUS_PENDING 重放/查询收敛（依赖麻花，要求已配置）
     dispatch_sync_seconds = _int_setting('DISPATCH_SYNC_SECONDS', 60)
     if dispatch_sync_seconds > 0 and mahua_configured:
         sched.add_job(
             _run_dispatch_compensation_job,
             IntervalTrigger(seconds=dispatch_sync_seconds),
             id='dispatch_compensation', name='dispatch_compensation',
+            replace_existing=True, coalesce=True, misfire_grace_time=300,
+        )
+        added += 1
+
+    # 出票轮询：每 2 分钟全量查询「出票中」订单的放单结果（DISPATCH_QUERY_SECONDS
+    # 可调，<=0 关闭；依赖麻花，要求已配置）
+    dispatch_query_seconds = _int_setting('DISPATCH_QUERY_SECONDS', 120)
+    if dispatch_query_seconds > 0 and mahua_configured:
+        sched.add_job(
+            _run_dispatch_query_job,
+            IntervalTrigger(seconds=dispatch_query_seconds),
+            id='dispatch_query', name='dispatch_query',
             replace_existing=True, coalesce=True, misfire_grace_time=300,
         )
         added += 1
@@ -189,10 +211,11 @@ def start():
     _scheduler = sched
     logger.info(
         '内置定时器已启动：token_refresh=%smin coming_pull=%smin '
-        'dispatch_compensation=%ss refund_retry=%ss tz=%s',
+        'dispatch_compensation=%ss dispatch_query=%ss refund_retry=%ss tz=%s',
         refresh_min if mahua_configured else 'off',
         coming_min if mahua_configured else 'off',
         dispatch_sync_seconds if mahua_configured else 'off',
+        dispatch_query_seconds if mahua_configured else 'off',
         refund_retry_seconds,
         tz,
     )

@@ -204,11 +204,19 @@ def _do_refund_order(order, refund):
 def auto_refund_dispatch_fail(order):
     """出票失败自动全额退款：出票失败(60) -> 退款中(70)，到账后 -> 已退款(80)。
 
+    幂等：同单已存在「出票失败自动退」退款单时直接跳过，不重复退款——
+    查询（/put/query 轮询）与回调（drawClose）双路径都可能触发本方法，
+    行锁 + 状态前置检查之外再加一层退款单存在性防线。
+
     退款单先落库提交、再在事务外发起微信退款：受理失败退款单记 FAIL，
     由退款重试任务（retry_failed_refunds）兜底重发——避免微信拒绝时把退款单
     连同状态迁移一起回滚，订单卡死在「出票失败」且无退款单可重试。
     """
     with transaction.atomic():
+        if Refund.objects.filter(
+                order_id=order.id, type=Refund.TYPE_DISPATCH_FAIL).exists():
+            logger.warning('出票失败退款单已存在，跳过重复退款 order=%s', order.order_ext_no)
+            return None
         if order.status == TicketOrder.STATUS_DISPATCH_FAIL:
             transition(order, TicketOrder.STATUS_REFUNDING)
         refund = Refund.objects.create(
