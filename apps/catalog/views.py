@@ -13,7 +13,6 @@ from apps.catalog.models import City, Movie, Cinema, Schedule
 from apps.catalog.serializers import (
     CitySerializer, MovieSerializer, CinemaSerializer, ScheduleSerializer, WEEKDAYS,
 )
-from apps.catalog import seat_map
 from apps.catalog import services as catalog_services
 from apps.common.response import ok, fail, BizError, ErrorCode
 
@@ -382,9 +381,10 @@ def schedules(request):
 def schedule_seats(request, schedule_id):
     """场次座位图：实时取麻花真实座位（含 seatId）+ 每座价格。
 
-    麻花座位「禁止拉取同步、实时获取」，故每次调用实时拉取；麻花异常时回退
-    seat_map 生成的兜底图（保证选座页不空）。返回体带 showId（麻花场次ID）与
-    restrictions（最多可选座数），供前端把真实 showId/seatId 带入下单、放单。
+    座位数据只来源于麻花实时接口（麻花约定座位禁止落库同步，逐次实时拉取），
+    不做任何本地兜底/生成图——拉取失败即报错，由用户重试，绝不展示假座位。
+    返回体带 showId（麻花场次ID）与 restrictions（最多可选座数），供前端把
+    真实 showId/seatId 带入下单、放单。
     """
     try:
         schedule = Schedule.objects.get(id=schedule_id, deleted=0)
@@ -394,19 +394,19 @@ def schedule_seats(request, schedule_id):
     catalog_services.ensure_sellable(schedule)
 
     show_id = schedule.up_schedule_id
-    rows, restrictions, min_price = [], None, None
     try:
         rows, restrictions, min_price = catalog_services.pull_seats(show_id)
     except Exception as exc:  # noqa: BLE001
         import logging
-        logging.getLogger('app').warning('实时拉座位失败，回退兜底图: %s', exc)
+        logging.getLogger('app').error('实时拉座位失败 schedule=%s show=%s err=%s',
+                                       schedule_id, show_id, exc)
+        raise BizError('座位数据获取失败，请稍后重试', code=50000)
 
-    if rows:
-        hall_name = schedule.hall_name or ''
-        price = min_price if min_price is not None else (schedule.min_price or 4500)
-    else:
-        # 兜底：确定性生成（骨架演示/无真实数据时）
-        rows, hall_name, price = seat_map.gen_seat_map(schedule)
+    if not rows:
+        raise BizError('该场次暂无可售座位', code=40400)
+
+    hall_name = schedule.hall_name or ''
+    price = min_price if min_price is not None else (schedule.min_price or 0)
 
     return ok({
         'scheduleId': schedule_id,

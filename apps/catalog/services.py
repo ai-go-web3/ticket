@@ -777,7 +777,7 @@ def pull_seats(show_id):
         maxSpeedPrice -> maxSpeedPrice 同上
         lovestatus/area -> 同名透出
         sectionId -> （不透出）仅用于 movieFilmSeatPrices 区域取价回退
-    兜底图（gen_seat_map）无 seatId 字段，前端 data-id 为空、放单只用 row/col。
+    无本地兜底图：座位只来源于麻花实时接口，拉取失败由视图层报错让用户重试。
 
     取价口径：座位级 fastPrice/maxSpeedPrice 真实报文常缺失（示例仅返回 price），
     缺失时按 seat.sectionId 回退 movieFilmSeatPrices 区域价格表，再回退默认区域；
