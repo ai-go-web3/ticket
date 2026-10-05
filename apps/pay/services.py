@@ -41,6 +41,22 @@ def _xml_to_dict(xml_str):
     return {child.tag: child.text for child in root}
 
 
+def _parse_wechat_resp(resp, context):
+    """解析微信 XML 响应；空响应/非 XML 时记录 HTTP 状态码辅助排查（返回 {}，
+    由调用方按 return_code 缺失走失败分支）。"""
+    resp.encoding = 'utf-8'  # 微信 XML 恒为 UTF-8；requests 对无 charset 的 text/plain 会误判为 latin-1
+    if not (resp.text or '').strip():
+        logger.error('微信接口返回空响应 %s status=%s content_type=%s',
+                     context, resp.status_code, resp.headers.get('Content-Type'))
+        return {}
+    try:
+        return _xml_to_dict(resp.text)
+    except ET.ParseError as exc:
+        logger.error('微信接口响应非XML %s status=%s err=%s body=%.200r',
+                     context, resp.status_code, exc, resp.text)
+        return {}
+
+
 def unified_order(order_id, openid):
     """统一下单，返回 requestPayment 参数。
 
@@ -84,7 +100,7 @@ def unified_order(order_id, openid):
         data=_dict_to_xml(params).encode(),
         timeout=10,
     )
-    result = _xml_to_dict(resp.text)
+    result = _parse_wechat_resp(resp, 'unifiedorder')
     if result.get('return_code') != 'SUCCESS' or result.get('result_code') != 'SUCCESS':
         logger.error('unified order failed: %s', result)
         raise BizError(f"统一下单失败: {result.get('return_msg') or result.get('err_code_des')}")
@@ -193,7 +209,8 @@ def _verify_sign(params, key):
 # ===== 微信退款（放单失败/回调失败场景的用户回款） =====
 
 REFUND_API = 'https://api.mch.weixin.qq.com/secapi/pay/refund'
-REFUND_QUERY_API = 'https://api.mch.weixin.qq.com/secapi/pay/refundquery'
+# 查询退款是 v2 普通接口（无需双向证书；/secapi/pay/refundquery 会 404 空响应）
+REFUND_QUERY_API = 'https://api.mch.weixin.qq.com/pay/refundquery'
 
 
 def wx_refund(order, refund):
@@ -240,7 +257,7 @@ def wx_refund(order, refund):
         REFUND_API, data=_dict_to_xml(params).encode(),
         cert=(cert, key) if real_refund else None, timeout=15,
     )
-    result = _xml_to_dict(resp.text)
+    result = _parse_wechat_resp(resp, 'refund')
     if result.get('return_code') != 'SUCCESS':
         logger.error('微信退款请求失败 refund=%s result=%s', refund.refund_ext_no, result)
         raise BizError(f"微信退款失败: {result.get('return_msg') or '通信异常'}")
@@ -256,17 +273,15 @@ def wx_refund(order, refund):
 
 
 def wx_refund_query(order, refund):
-    """查询微信退款结果（v2 /secapi/pay/refundquery，双向证书）——退款对账兜底用。
+    """查询微信退款结果（v2 /pay/refundquery，普通接口无需商户证书）——退款对账兜底用。
 
     返回该笔退款的状态字符串（微信枚举）：SUCCESS/CHANGE(退款异常退回用户卡，
     视为到账)/FAIL/REFUNDCLOSE(失败，可重发)/PROCESSING(处理中)。
-    未配置商户证书/PAY_KEY（骨架降级环境）返回 None：此时退款受理即到账，
+    未配置 MCHID/PAY_KEY（骨架降级环境）返回 None：此时退款受理即到账，
     无需对账。
     """
     cfg = settings.WECHAT
-    cert = cfg.get('MCH_CERT_PATH') or ''
-    key = cfg.get('MCH_KEY_PATH') or ''
-    if not (cfg.get('MCHID') and cfg.get('PAY_KEY') and cert and key):
+    if not (cfg.get('MCHID') and cfg.get('PAY_KEY')):
         return None
 
     params = {
@@ -278,10 +293,9 @@ def wx_refund_query(order, refund):
     }
     params['sign'] = _sign(params, cfg['PAY_KEY'])
     resp = requests.post(
-        REFUND_QUERY_API, data=_dict_to_xml(params).encode(),
-        cert=(cert, key), timeout=15,
+        REFUND_QUERY_API, data=_dict_to_xml(params).encode(), timeout=15,
     )
-    result = _xml_to_dict(resp.text)
+    result = _parse_wechat_resp(resp, 'refundquery')
     if result.get('return_code') != 'SUCCESS' or result.get('result_code') != 'SUCCESS':
         logger.error('微信退款查询失败 refund=%s result=%s', refund.refund_ext_no, result)
         return None

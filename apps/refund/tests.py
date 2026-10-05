@@ -1,7 +1,7 @@
 """退款对账测试：微信「查询退款」兜底收敛「退款中」订单。
 
 背景：退款到账依赖微信退款结果通知回写；通知丢失时订单停留「退款中(70)」
-而钱已到账。reconcile_refunding_refunds 主动调 /secapi/pay/refundquery 对账：
+而钱已到账。reconcile_refunding_refunds 主动调 /pay/refundquery 对账：
 SUCCESS/CHANGE -> 已退款(80)；FAIL/REFUNDCLOSE -> 退款单记 FAIL；PROCESSING 跳过。
 """
 from datetime import timedelta

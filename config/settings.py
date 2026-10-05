@@ -203,16 +203,16 @@ JWT_EXPIRE_SECONDS = int(os.environ.get('JWT_EXPIRE_SECONDS', '7200'))
 ADMIN_TOKEN_EXPIRE_SECONDS = int(os.environ.get('ADMIN_TOKEN_EXPIRE_SECONDS', '7200'))
 
 # ===== CORS：仅对 B 端后台 /api/v1/admin 生效 =====
-# 运营后台是独立页面（admin-rules.html），可能以 file:// 打开（浏览器 Origin 为 'null'），
-# 需放开跨域才能直连接口。安全考量：
-#   · 用 CORS_URLS_REGEX 把跨域处理严格限定在 /api/v1/admin，C 端与回调接口一律不受影响；
-#   · 鉴权走 Authorization: Bearer <admin token>（由 apps.adminapi.IsAdmin 自守），非 Cookie，
-#     故不开 CORS_ALLOW_CREDENTIALS——既不携带 Cookie 也无 CSRF 面，允许任意来源只是放开
-#     「跨源预检/读头」，拿到数据仍必须有有效管理令牌。
+# 正式前端服务（admin-ui）与 API 同域部署（/ops/**），浏览器不发跨域请求，无需 CORS。
+# 默认关闭「允许任意来源」；仅当过渡期仍用 file:// 打开 prototype/admin-rules.html 时，
+# 设环境变量 ADMIN_CORS_ALLOW_ALL=true 临时放开（上线正式前端后应移除）。
+# 如需白名单：ADMIN_CORS_ALLOWED_ORIGINS=https://ops.example.com,https://a.b.com
 CORS_URLS_REGEX = r'^/api/v1/admin/.*$'
-CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_ALL_ORIGINS = os.environ.get('ADMIN_CORS_ALLOW_ALL', 'false').lower() == 'true'
 CORS_ALLOW_CREDENTIALS = False
-CORS_ALLOWED_ORIGIN_REGEXES = []  # 若要收紧：改此白名单并把 CORS_ALLOW_ALL_ORIGINS 置 False
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r.strip() for r in os.environ.get('ADMIN_CORS_ALLOWED_ORIGINS', '').split(',') if r.strip()
+]  # 正则白名单，如 ^https://[a-z0-9.-]+\.example\.com$
 CORS_ALLOW_HEADERS = (
     'accept', 'accept-encoding', 'authorization', 'content-type', 'dnt',
     'origin', 'user-agent', 'x-csrftoken', 'x-requested-with',
@@ -296,3 +296,9 @@ USE_TZ = False
 
 STATIC_URL = '/static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# ===== 运营后台前端（admin-ui 构建产物）同域托管 =====
+# Docker 多阶段构建会把 admin-ui/dist 拷到 /app/ops_static（见 Dockerfile）；
+# 本地未构建时目录不存在，/ops/ 自动不挂载（config/urls.py）。
+# 自有云服务器改走 Nginx 托管时，设 OPS_UI_DIR 为空串即可关闭 Django 托管。
+OPS_UI_DIR = os.environ.get('OPS_UI_DIR', str(BASE_DIR / 'ops_static'))

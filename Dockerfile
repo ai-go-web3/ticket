@@ -27,6 +27,9 @@ RUN pip install --no-cache-dir -i https://mirrors.cloud.tencent.com/pypi/simple 
     && pip install --no-cache-dir -i https://mirrors.cloud.tencent.com/pypi/simple gunicorn
 
 # 拷贝项目代码
+# 注意：/app/ops_static 为运营后台前端（admin-ui）构建产物，由仓库根 build-admin.sh
+# 在 docker build 之前生成（npm run build 后拷入）；缺失时 /ops/ 会返回 404 提示，
+# 不影响后端与 API。
 COPY . .
 
 # 启动入口：信任云托管注入的自签证书（修复容器内调 api.weixin.qq.com 的

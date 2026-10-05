@@ -303,7 +303,7 @@ def reconcile_refunding_refunds(limit=100, grace_seconds=60):
 
     退款到账依赖微信退款结果通知（/pay/refund-notify）回写；通知丢失/推送
     失败时订单会停留「退款中(70)」而钱实际已到账。此任务对「退款中」的退款单
-    调微信「查询退款」接口（/secapi/pay/refundquery）对账：
+    调微信「查询退款」接口（/pay/refundquery）对账：
         SUCCESS / CHANGE      -> 到账：退款单记已到账，订单 -> 已退款(80)；
         FAIL / REFUNDCLOSE    -> 失败：退款单记 FAIL，交退款重试任务重发；
         PROCESSING / 查询失败  -> 跳过，等下一轮。
