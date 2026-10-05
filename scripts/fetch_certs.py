@@ -8,8 +8,9 @@
 
 方案（替代环境变量注入）：
 - 证书文件先上传到微信云托管「对象存储」（控制台可视化上传，保留原始换行）；
-- 容器启动时在容器内调用开放接口服务 `http://api.weixin.qq.com/_/cos/getauth`
+- 容器启动时在容器内调用开放接口服务 `https://api.weixin.qq.com/_/cos/getauth`
   获取临时密钥（该接口只能在容器内调用，识别云托管身份），再用 COS SDK 下载证书到本地。
+  注意用 https：该接口在云托管内网走 443，用 http(80) 会被内网拒绝连接。
 
 依赖：cos-python-sdk-v5（见 requirements.txt）。
 
@@ -32,7 +33,7 @@ import sys
 
 import requests
 
-GETAUTH_URL = 'http://api.weixin.qq.com/_/cos/getauth'
+GETAUTH_URL = 'https://api.weixin.qq.com/_/cos/getauth'
 
 
 def log(msg):
