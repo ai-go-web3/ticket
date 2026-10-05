@@ -40,4 +40,11 @@ else
     echo "[entrypoint] 跳过证书拉取；若退款需真实打款，请补齐相关环境变量。"
 fi
 
+# 4) 数据库迁移：实例每次启动时执行（幂等，已应用的迁移自动跳过）。
+#    保证「代码上线、表结构跟上」同步，避免新代码查新表（如 markup_rule）
+#    而表未创建的窗口期（曾致座位/下单接口 50000）。
+#    迁移失败 fail-fast：宁可实例起不来，也不带残缺 schema 对外服务。
+echo "[entrypoint] 执行数据库迁移 python manage.py migrate"
+python /app/manage.py migrate --noinput
+
 exec "$@"

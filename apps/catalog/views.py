@@ -14,6 +14,7 @@ from apps.catalog.serializers import (
     CitySerializer, MovieSerializer, CinemaSerializer, ScheduleSerializer, WEEKDAYS,
 )
 from apps.catalog import services as catalog_services
+from apps.catalog import recommend
 from apps.common.response import ok, fail, BizError, ErrorCode
 
 
@@ -504,3 +505,16 @@ def sync_movies(request):
     if res.get('error'):
         return fail(res['error'], code=ErrorCode.UP_ERROR)
     return ok(res, msg='同步完成')
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def home_recommends(request):
+    """首页「本月推荐」推荐位轮播（运营配置 + 空位回退自动 Top4）。
+
+    query: cityCode（前端当前城市，麻花 cityId 或国标码；缺省则只出全国投放位）。
+    返回 {section:{title,max_show,fallback_top4}, slides:[{type:movie|banner,...}]}。
+    装配逻辑见 apps/catalog/recommend.py，与后台预览共用同一份。
+    """
+    city_code = request.query_params.get('cityCode')
+    return ok(recommend.build_home_recommends(city_code))

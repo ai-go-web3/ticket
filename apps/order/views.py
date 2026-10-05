@@ -4,6 +4,7 @@ import logging
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
 from rest_framework import serializers
+from django.utils import timezone
 
 from apps.common.response import ok, fail, BizError
 from apps.order import services
@@ -52,9 +53,11 @@ def order_detail(request, order_id):
 
 @api_view(['GET'])
 def my_orders(request):
-    """我的订单列表。支持 tab（四态分组）或 status（单一状态）过滤。
+    """我的订单列表。支持 tab（四态分组）/ status（单一状态）/ months（近 N 月）过滤。
 
-    待付款已超时的单先惰性关闭再返回（定时器兜底前的即时收敛）。
+    - months：按下单时间只返回近 N 个自然月，入参钳制在 1~3（默认 3，即上限全量）；
+    - 排序固定按下单时间倒序（created_at DESC），前端无需再排；
+    - 待付款已超时的单先惰性关闭再返回（定时器兜底前的即时收敛）。
     """
     qs = TicketOrder.objects.filter(user_id=request.user_id, deleted=0)
     tab = request.query_params.get('tab')
@@ -63,11 +66,28 @@ def my_orders(request):
         qs = qs.filter(status__in=ORDER_TAB_STATUS[tab])
     elif status:
         qs = qs.filter(status=status)
+    try:
+        months = int(request.query_params.get('months', 3))
+    except (TypeError, ValueError):
+        months = 3
+    qs = qs.filter(created_at__gte=_months_ago(max(1, min(months, 3))))
     qs = qs.order_by('-created_at')
     for order in qs:
         if services.close_if_expired(order):
             order.refresh_from_db()
     return ok(OrderSerializer(qs, many=True).data)
+
+
+def _months_ago(months):
+    """当前时刻往前推 months 个自然月（月末日期自动钳制，如 3/31 - 1月 = 2/28）。"""
+    import calendar
+    now = timezone.now()
+    month, year = now.month - months, now.year
+    while month <= 0:
+        month += 12
+        year -= 1
+    day = min(now.day, calendar.monthrange(year, month)[1])
+    return now.replace(year=year, month=month, day=day)
 
 
 @api_view(['GET'])

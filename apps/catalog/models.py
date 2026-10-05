@@ -185,3 +185,78 @@ class MarkupRule(models.Model):
 
     def __str__(self):
         return f'{self.id}-{self.name}'
+
+
+class RecommendSection(models.Model):
+    """C 端首页「本月推荐」栏目级设置（单例行）。
+
+    运营端可改栏目标题、最多展示条数、以及「无启用推荐位时是否回退自动 Top4」。
+    取用见 load()：无记录时自动创建一份默认配置，保证单例存在。
+    """
+    title = models.CharField(max_length=32, default='本月推荐', verbose_name='栏目标题')
+    max_show = models.SmallIntegerField(default=6, verbose_name='最多展示条数')
+    fallback_top4 = models.SmallIntegerField(default=1, verbose_name='空位回退自动Top4 1是 0否')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'recommend_section'
+
+    @classmethod
+    def load(cls):
+        obj = cls.objects.first()
+        if obj is None:
+            obj = cls.objects.create()
+        return obj
+
+    def __str__(self):
+        return f'recommend-section-{self.id}'
+
+
+class RecommendSlot(models.Model):
+    """首页推荐位轮播的一格：影片或自定义 banner（混合轮播）。
+
+    - slot_type='movie'：关联内部 Movie.id（非麻花 up_movie_id），海报/片名/角标由影片实时派生。
+    - slot_type='banner'：使用 title/subtitle/cta + bg(渐变) 或 image_url(自定义底图)。
+    - city_code：'all' 或空 = 全国；否则为麻花城市ID（与 City.city_code / MarkupRule.city_codes 同口径）。
+    - enabled + sort + 生效时间窗口决定 C 端展示；软删保留审计。
+    """
+    TYPE_MOVIE = 'movie'
+    TYPE_BANNER = 'banner'
+    TYPE_CHOICES = [(TYPE_MOVIE, '影片'), (TYPE_BANNER, '横幅')]
+
+    LINK_MOVIE = 'movie'
+    LINK_CINEMA = 'cinema'
+    LINK_COUPON = 'coupon'
+    LINK_ACTIVITY = 'activity'
+    LINK_NONE = 'none'
+
+    slot_type = models.CharField(max_length=8, default=TYPE_MOVIE, verbose_name='movie/banner')
+    movie_id = models.BigIntegerField(null=True, blank=True, verbose_name='内部影片ID(Movie.id)')
+    title = models.CharField(max_length=128, null=True, blank=True, verbose_name='标题(banner用)')
+    subtitle = models.CharField(max_length=255, null=True, blank=True, verbose_name='副标题(banner用)')
+    cta = models.CharField(max_length=64, null=True, blank=True, verbose_name='按钮文案(banner用)')
+    bg = models.CharField(max_length=255, null=True, blank=True, verbose_name='底图渐变(banner用)')
+    image_url = models.CharField(max_length=512, null=True, blank=True, verbose_name='自定义底图URL')
+    badge = models.CharField(max_length=32, null=True, blank=True, verbose_name='角标文案')
+    badge_color = models.CharField(max_length=8, default='pink', verbose_name='pink/blue/gold')
+    city_code = models.CharField(max_length=16, default='all', verbose_name='all或麻花城市ID')
+    link_type = models.CharField(max_length=16, default=LINK_MOVIE, verbose_name='跳转类型')
+    link_ref = models.CharField(max_length=128, null=True, blank=True, verbose_name='跳转引用')
+    sort = models.IntegerField(default=0, verbose_name='排序(小者前)')
+    enabled = models.SmallIntegerField(default=1, verbose_name='1启用 0停用')
+
+    effective_from = models.DateTimeField(null=True, blank=True, verbose_name='生效起')
+    effective_to = models.DateTimeField(null=True, blank=True, verbose_name='生效止')
+
+    version = models.IntegerField(default=0, verbose_name='乐观锁')
+    deleted = models.SmallIntegerField(default=0, verbose_name='软删')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'recommend_slot'
+        ordering = ['sort', 'id']
+        indexes = [models.Index(fields=['enabled', 'deleted'])]
+
+    def __str__(self):
+        return f'{self.id}-{self.slot_type}-{self.title or self.movie_id}'
