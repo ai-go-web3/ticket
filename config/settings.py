@@ -37,6 +37,7 @@ INSTALLED_APPS = [
     'apps.refund',         # 退款/拦截/纠纷
     'apps.distributor',    # CPS 分销
     'apps.upadapter',      # 麻花 SPI 适配层
+    'apps.adminapi',       # B 端运营后台（同工程，挂 /api/v1/admin）
 ]
 
 MIDDLEWARE = [
@@ -198,6 +199,27 @@ PRICE_MARKUP_RATE = float(os.environ.get('PRICE_MARKUP_RATE', '0.05') or 0)
 
 # JWT
 JWT_EXPIRE_SECONDS = int(os.environ.get('JWT_EXPIRE_SECONDS', '7200'))
+# 后台管理 token 有效期（独立于 C 端，建议短一些）
+ADMIN_TOKEN_EXPIRE_SECONDS = int(os.environ.get('ADMIN_TOKEN_EXPIRE_SECONDS', '7200'))
+
+# ===== CORS：仅对 B 端后台 /api/v1/admin 生效 =====
+# 运营后台是独立页面（admin-rules.html），可能以 file:// 打开（浏览器 Origin 为 'null'），
+# 需放开跨域才能直连接口。安全考量：
+#   · 用 CORS_URLS_REGEX 把跨域处理严格限定在 /api/v1/admin，C 端与回调接口一律不受影响；
+#   · 鉴权走 Authorization: Bearer <admin token>（由 apps.adminapi.IsAdmin 自守），非 Cookie，
+#     故不开 CORS_ALLOW_CREDENTIALS——既不携带 Cookie 也无 CSRF 面，允许任意来源只是放开
+#     「跨源预检/读头」，拿到数据仍必须有有效管理令牌。
+CORS_URLS_REGEX = r'^/api/v1/admin/.*$'
+CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_CREDENTIALS = False
+CORS_ALLOWED_ORIGIN_REGEXES = []  # 若要收紧：改此白名单并把 CORS_ALLOW_ALL_ORIGINS 置 False
+CORS_ALLOW_HEADERS = (
+    'accept', 'accept-encoding', 'authorization', 'content-type', 'dnt',
+    'origin', 'user-agent', 'x-csrftoken', 'x-requested-with',
+    'x-task-token', 'x-trace-id',
+)
+CORS_ALLOW_METHODS = ('DELETE', 'GET', 'OPTIONS', 'PATCH', 'POST', 'PUT')
+CORS_PREFLIGHT_MAX_AGE = 86400
 
 # ===== 运维/定时任务 =====
 # 内部同步 HTTP 接口的共享令牌（手动/外部触发用），请求头 X-Task-Token 携带。

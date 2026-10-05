@@ -52,6 +52,8 @@ PROTECTED_PREFIXES = (
 )
 # 受保护前缀中的豁免路径（运维接口，走 TASK_TOKEN 自鉴权）
 PROTECTED_EXEMPT_PATHS = ('/api/v1/order/finance/daily',)
+# B 端后台前缀：整体绕过 C 端强制 401，由 apps.adminapi 的 IsAdmin 权限自守
+ADMIN_EXEMPT_PREFIX = '/api/v1/admin'
 
 
 class JWTAuthMiddleware:
@@ -80,6 +82,11 @@ class JWTAuthMiddleware:
         uid = self._resolve_user_id(request)
         if uid is not None:
             request.user_id = uid  # 公开接口若带有效 token 也顺带注入
+
+        # B 端后台整体绕过 C 端强制 401（管理 token 的 aid 不在 app_user 表，
+        # 若走下面的校验会误判未登录）；后台接口由 apps.adminapi.IsAdmin 自守。
+        if path.startswith(ADMIN_EXEMPT_PREFIX):
+            return self.get_response(request)
 
         protected = any(path.startswith(p) for p in PROTECTED_PREFIXES)
         protected = protected and not any(path.startswith(e) for e in PROTECTED_EXEMPT_PATHS)

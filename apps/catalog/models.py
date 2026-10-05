@@ -138,3 +138,50 @@ class Schedule(models.Model):
             models.Index(fields=['cinema_id', 'movie_id', 'start_at']),
             models.Index(fields=['movie_id', 'start_at']),
         ]
+
+
+class MarkupRule(models.Model):
+    """上浮加价规则（定价中枢，见 apps/catalog/markup.py 解析器）。
+
+    维度字段留空/NULL = 该维度不限；命中即停，按 priority 升序。
+    is_fallback=1 为兜底规则（其它规则均不满足时用它）；无兜底则回退全局
+    settings.PRICE_MARKUP_RATE（比例），保证与改造前行为等价。
+    """
+    MODE_RATE = 'rate'
+    MODE_FLAT = 'flat'
+    MODE_CHOICES = [(MODE_RATE, '售价比例'), (MODE_FLAT, '固定加价(分/张)')]
+
+    name = models.CharField(max_length=64, verbose_name='规则名')
+    priority = models.IntegerField(default=100, verbose_name='优先级(小者先)')
+    is_active = models.SmallIntegerField(default=1, verbose_name='1启用 0停用')
+    is_fallback = models.SmallIntegerField(default=0, verbose_name='是否兜底规则')
+
+    # —— 匹配维度（空=不限）——
+    movie_ids = models.JSONField(null=True, blank=True, verbose_name='影片ID列表')
+    brands = models.JSONField(null=True, blank=True, verbose_name='院线品牌列表')
+    city_codes = models.JSONField(null=True, blank=True, verbose_name='城市码列表')
+    hall_types = models.JSONField(null=True, blank=True, verbose_name='影厅类型/show_version列表')
+    weekday_in = models.JSONField(null=True, blank=True, verbose_name='星期几(1-7)列表')
+    hour_from = models.SmallIntegerField(null=True, blank=True, verbose_name='时段起(0-23)')
+    hour_to = models.SmallIntegerField(null=True, blank=True, verbose_name='时段止(0-23)')
+
+    # —— 加价方式 ——
+    mode = models.CharField(max_length=8, default=MODE_RATE, verbose_name='加价方式')
+    rate = models.DecimalField(null=True, blank=True, max_digits=6, decimal_places=4,
+                               verbose_name='比例(0.12=12%)')
+    flat_fen = models.BigIntegerField(null=True, blank=True, verbose_name='固定加价(分/张)')
+
+    effective_from = models.DateTimeField(null=True, blank=True, verbose_name='生效起')
+    effective_to = models.DateTimeField(null=True, blank=True, verbose_name='生效止')
+
+    version = models.IntegerField(default=0, verbose_name='乐观锁')
+    deleted = models.SmallIntegerField(default=0, verbose_name='软删')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'markup_rule'
+        ordering = ['priority', 'id']
+
+    def __str__(self):
+        return f'{self.id}-{self.name}'

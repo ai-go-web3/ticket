@@ -11,6 +11,7 @@ from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from apps.catalog.models import City, Movie, Cinema, Schedule
+from apps.catalog import markup
 from apps.catalog.city_mapping import (
     MAHUA_CITY_MAP, HOT_CITY_IDS, mahua_to_std,
 )
@@ -76,16 +77,21 @@ def _parse_price(value):
         return None
 
 
-def _markup_fen(fen):
-    """成本价(分)按 settings.PRICE_MARKUP_RATE 上浮，四舍五入到分。
+def _markup_fen(fen, rule=None):
+    """成本价(分) 上浮为售价(分)。
 
-    麻花 fastPrice/maxSpeedPrice 是我方成本价，展示与计价前统一先上浮
-    （默认 5%），原价 price 为挂牌价不上浮。费率设 0 即不上浮。
+    rule = (mode, rate, flat_fen)：来自 apps.catalog.markup.resolve_markup 对某场次上下文的
+    命中结果。mode=rate 按售价比例上浮、mode=flat 每张加固定分。
+    rule=None 时退化为全局 settings.PRICE_MARKUP_RATE 比例上浮（与改造前完全一致，兜底）。
+    原价 price 为挂牌价不走本函数（不上浮）；上浮后售价高于原价由调用方 min() 兜住。
     """
     if not fen or fen <= 0:
         return fen
-    rate = float(getattr(settings, 'PRICE_MARKUP_RATE', 0.05) or 0)
-    return int(round(fen * (1 + rate)))
+    if rule is None:
+        rate = float(getattr(settings, 'PRICE_MARKUP_RATE', 0.05) or 0)
+        return int(round(fen * (1 + rate)))
+    mode, rate, flat_fen = rule
+    return markup.uplift_fen(fen, mode, rate, flat_fen)
 
 
 def _parse_date(value):
@@ -233,6 +239,16 @@ def _upsert_schedule(data):
     except (TypeError, ValueError):
         duration_min = None
 
+    show_type = data.get('planType') or data.get('showVersionType')
+    # 命中上浮规则（无命中=全局兜底）：与座位/建单同一口径
+    rule = markup.resolve_markup(
+        movie_id=movie.id if movie else None,
+        brand=cinema.brand if cinema else None,
+        city_code=cinema.city_code if cinema else None,
+        hall_type=show_type,
+        show_at=start,
+    )
+
     defaults = {
         'cinema_id': cinema.id if cinema else 0,
         'movie_id': movie.id if movie else 0,
@@ -240,12 +256,12 @@ def _upsert_schedule(data):
         'start_at': start,
         'end_at': (start + timedelta(minutes=duration_min)) if (start and duration_min) else None,
         'stopsell_at': stopsell,
-        'show_type': data.get('planType') or data.get('showVersionType'),
+        'show_type': show_type,
         'language': data.get('language'),
         # min_price=优惠售价（分）：fastPrice 优先，其次 maxSpeedPrice，最后原价兜底；
-        # fast/maxSpeed 为成本价，先按 PRICE_MARKUP_RATE 上浮再入库，与座位口径一致
+        # fast/maxSpeed 为成本价，按命中规则上浮再入库，与座位口径一致
         'min_price': _seat_sale_price(
-            price, _markup_fen(fast_price), _markup_fen(max_speed_price)) or 0,
+            price, _markup_fen(fast_price, rule), _markup_fen(max_speed_price, rule)) or 0,
         'origin_price': price,
         # 原始价快照（未上浮，分）：对账/审计用，min_price 的上浮前口径
         'raw_price_json': {
@@ -793,6 +809,11 @@ def pull_seats(show_id):
     region_prices = _parse_region_prices(data.get('movieFilmSeatPrices'))
     default_region = region_prices.get('0') or next(iter(region_prices.values()), None)
 
+    # 同一次座位拉取共用一条上浮规则：按 up_schedule_id 找到本地排片再解析。
+    # 找不到排片（show_id 未同步）时 rule=None，_markup_fen 回退全局常量口径。
+    _sched = Schedule.objects.filter(up_schedule_id=str(show_id)).first()
+    rule = markup.resolve_for_schedule(_sched) if _sched else None
+
     grouped = {}
     for s in seat_data:
         try:
@@ -812,12 +833,12 @@ def pull_seats(show_id):
             price_fen = rp
         # 成本价先上浮再下发：座位chip、选座合计、建单 salePrice 全链路同一口径。
         # 座位级缺失 → 区域价 → （仍无则保持 None，salePrice 兜底原价）
-        fast_fen = _markup_fen(_parse_price(s.get('fastPrice')))
+        fast_fen = _markup_fen(_parse_price(s.get('fastPrice')), rule)
         if fast_fen is None:
-            fast_fen = _markup_fen(rfast)
-        max_speed_fen = _markup_fen(_parse_price(s.get('maxSpeedPrice')))
+            fast_fen = _markup_fen(rfast, rule)
+        max_speed_fen = _markup_fen(_parse_price(s.get('maxSpeedPrice')), rule)
         if max_speed_fen is None:
-            max_speed_fen = _markup_fen(rmax)
+            max_speed_fen = _markup_fen(rmax, rule)
         # 上浮后售价不得高于原价，避免「原价-售价」出现反向优惠
         if price_fen and price_fen > 0:
             fast_fen = min(fast_fen, price_fen) if fast_fen else fast_fen

@@ -10,6 +10,7 @@ from apps.common.response import BizError, ErrorCode
 from apps.common.utils import gen_order_ext_no
 from apps.order.models import TicketOrder, OrderPayment, MahuaDispatch
 from apps.catalog import services as catalog_services
+from apps.catalog import markup
 from apps.catalog.models import Schedule, Movie, Cinema
 
 logger = logging.getLogger('app')
@@ -48,15 +49,17 @@ def create_order(user_id, payload):
         # 2. 计算金额（分）：不收服务费，总费 = ΣsalePrice（成本上浮后的每座售价求和）。
         #    快速模式按 maxSpeedPrice 收费、放单走快速通道（model=1），预估成本按原始 maxSpeedPrice 口径；
         #    特惠模式按 fastPrice 收费、放单默认特惠通道，预估成本按原始 fastPrice 口径。
-        from django.conf import settings as dj_settings
-        rate = float(getattr(dj_settings, 'PRICE_MARKUP_RATE', 0.05) or 0)
+        #    上浮口径与该场次取价（pull_seats）完全一致：同一条命中规则 (mode, rate, flat_fen)。
+        mode, rate, flat_fen = markup.resolve_for_schedule(schedule)
         buy_mode = payload.get('buyMode') or 'tehui'
 
         def _raw_cost(fen):
-            """上浮后售价(分)反推原始成本价(分)：raw = round(fen/(1+rate))，±1分舍入误差。"""
-            if not fen or fen <= 0:
-                return None
-            return int(round(fen / (1 + rate))) if rate > 0 else int(fen)
+            """上浮后售价(分)反推原始成本价(分)：按命中规则口径反向。
+
+            rate 模式 raw=round(fen/(1+rate))（±1分舍入）；flat 模式 raw=fen-flat_fen。
+            注意：仅在结算价确实是按此规则上浮时反推才成立；若规则在取价后变更会引入误差。
+            """
+            return markup.reverse_cost_fen(fen, mode, rate, flat_fen)
 
         ticket_amount = 0
         est_fast = 0
