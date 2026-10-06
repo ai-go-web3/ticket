@@ -5,6 +5,8 @@
 
   - movie_ids  → 匹配 Schedule.movie_id = **内部 Movie.id（Django 主键）**，不是麻花 up_movie_id。
                  影片搜索返回内部 id + 片名，前端显示片名、写入内部 id。
+  - cinema_ids → 匹配 Schedule.cinema_id = **内部 Cinema.id（Django 主键）**，不是麻花 up_cinema_id。
+                 影院搜索返回内部 id + 影院名（另附麻花 up_cinema_id 供展示），前端显示影院名、写入内部 id。
   - city_codes → 匹配 Cinema.city_code = **麻花城市ID（字符串，如成都=8）**，非国标 std_code。
   - brands     → 匹配 Cinema.brand（院线品牌，自由字符串），取自本地影院表 distinct。
   - hall_types → 匹配 Schedule.show_type（2D/3D/IMAX…），取自排片 distinct；另附常用预设便于主动配置。
@@ -81,6 +83,47 @@ def refdata_movies(request):
         'release_date': m.release_date.isoformat() if m.release_date else None,
         'poster_url': m.poster_url,
     } for m in rows]
+    return ok({'items': items})
+
+
+@api_view(['GET'])
+@authentication_classes(_AUTH)
+@permission_classes(_PERM)
+def refdata_cinemas(request):
+    """影院查找（供影院维度多选，写入 cinema_ids = 内部 Cinema.id，非麻花 up_cinema_id）。
+
+    query:
+      - kw        : 影院名模糊搜索（icontains），或按麻花影院ID(up_cinema_id)精确匹配。
+      - ids       : 逗号分隔的内部 Cinema.id 列表，用于「编辑已有规则」时按 ID 反查影院名回填。
+      - city_code : 可选，按麻花城市ID 收敛（与 Cinema.city_code 同口径）。
+      - limit     : 条数上限，默认 30，最大 50。
+    返回 items：[{id(内部PK), name, up_cinema_id(麻花影院代码), city_code, brand, business_status}]。
+    """
+    qs = Cinema.objects.filter(deleted=0)
+
+    ids_raw = (request.query_params.get('ids') or '').strip()
+    kw = (request.query_params.get('kw') or '').strip()
+    city_code = (request.query_params.get('city_code') or '').strip()
+    limit = _clamp_limit(request.query_params.get('limit'))
+
+    if ids_raw:
+        id_list = [int(x) for x in ids_raw.split(',') if x.strip().isdigit()]
+        qs = qs.filter(id__in=id_list)
+    else:
+        if kw:
+            qs = qs.filter(Q(name__icontains=kw) | Q(up_cinema_id=kw))
+        if city_code:
+            qs = qs.filter(city_code=city_code)
+
+    rows = list(qs.order_by('id')[:limit])
+    items = [{
+        'id': c.id,
+        'name': c.name,
+        'up_cinema_id': c.up_cinema_id,
+        'city_code': c.city_code,
+        'brand': c.brand,
+        'business_status': c.business_status,
+    } for c in rows]
     return ok({'items': items})
 
 

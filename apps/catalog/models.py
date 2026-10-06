@@ -158,6 +158,7 @@ class MarkupRule(models.Model):
 
     # —— 匹配维度（空=不限）——
     movie_ids = models.JSONField(null=True, blank=True, verbose_name='影片ID列表')
+    cinema_ids = models.JSONField(null=True, blank=True, verbose_name='影院ID列表(内部Cinema.id)')
     brands = models.JSONField(null=True, blank=True, verbose_name='院线品牌列表')
     city_codes = models.JSONField(null=True, blank=True, verbose_name='城市码列表')
     hall_types = models.JSONField(null=True, blank=True, verbose_name='影厅类型/show_version列表')

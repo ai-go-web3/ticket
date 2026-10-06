@@ -21,7 +21,7 @@ class MarkupRuleSerializer(serializers.ModelSerializer):
     class Meta:
         model = MarkupRule
         fields = ['id', 'name', 'priority', 'is_active', 'is_fallback',
-                  'movie_ids', 'brands', 'city_codes', 'hall_types', 'weekday_in',
+                  'movie_ids', 'cinema_ids', 'brands', 'city_codes', 'hall_types', 'weekday_in',
                   'hour_from', 'hour_to',
                   'mode', 'rate', 'flat_fen',
                   'effective_from', 'effective_to',

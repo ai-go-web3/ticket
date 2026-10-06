@@ -74,6 +74,20 @@ class RuleMatchTests(TestCase):
         self.assertEqual(markup.resolve_markup(brand='CGV')[1],
                          float(settings.PRICE_MARKUP_RATE))
 
+    def test_cinema_dimension_hit_and_miss(self):
+        MarkupRule.objects.create(name='指定影院+15%', priority=1, is_active=1,
+                                  mode=markup.MODE_RATE, rate=0.15, cinema_ids=[42, 43])
+        markup.clear_rules_cache()
+        # 内部 Cinema.id 命中（存内部主键，非麻花 up_cinema_id）
+        self.assertEqual(markup.resolve_markup(cinema_id=42)[1], 0.15)
+        self.assertEqual(markup.resolve_markup(cinema_id=43)[1], 0.15)
+        # 其它影院不命中 -> 落回全局兜底
+        self.assertEqual(markup.resolve_markup(cinema_id=99)[1],
+                         float(settings.PRICE_MARKUP_RATE))
+        # 无影院上下文时，含 cinema_ids 的规则不命中（保守）
+        self.assertEqual(markup.resolve_markup()[1],
+                         float(settings.PRICE_MARKUP_RATE))
+
     def test_priority_lower_wins(self):
         MarkupRule.objects.create(name='高优先', priority=1, is_active=1,
                                   mode=markup.MODE_RATE, rate=0.30)

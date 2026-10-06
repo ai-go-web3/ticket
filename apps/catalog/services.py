@@ -243,6 +243,7 @@ def _upsert_schedule(data):
     # 命中上浮规则（无命中=全局兜底）：与座位/建单同一口径
     rule = markup.resolve_markup(
         movie_id=movie.id if movie else None,
+        cinema_id=cinema.id if cinema else None,
         brand=cinema.brand if cinema else None,
         city_code=cinema.city_code if cinema else None,
         hall_type=show_type,

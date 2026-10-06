@@ -34,6 +34,7 @@ urlpatterns = [
     # 屏2 · 规则维度参考数据（只读，供运营查/选）
     path('refdata/options', views_refdata.refdata_options),
     path('refdata/movies', views_refdata.refdata_movies),
+    path('refdata/cinemas', views_refdata.refdata_cinemas),
     path('refdata/cities', views_refdata.refdata_cities),
     path('refdata/brands', views_refdata.refdata_brands),
     path('refdata/hall-types', views_refdata.refdata_hall_types),

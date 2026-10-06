@@ -3,7 +3,7 @@
 设计要点：
 - 兜底 = 行为不变：无任何规则命中时，沿用 settings.PRICE_MARKUP_RATE（比例上浮），
   与改造前完全等价，保证存量与新增计价一致。
-- 维度匹配：movie_ids / brands / city_codes / hall_types / weekday_in / hour 窗口 /
+- 维度匹配：movie_ids / cinema_ids / brands / city_codes / hall_types / weekday_in / hour 窗口 /
   生效时间；某维度为空即「不限」，规则按 priority 升序、命中即停。
 - 加价方式：rate=比例（sale=cost×(1+rate)）；flat=固定（sale=cost+flat_fen/张）。
 - 缓存：规则表小、变更少，读缓存 30s TTL；后台保存规则时显式清缓存即时生效。
@@ -36,7 +36,7 @@ def _load_rules():
             MarkupRule.objects.filter(is_active=1)
             .order_by('priority', 'id').values(
                 'id', 'priority', 'is_fallback', 'mode', 'rate', 'flat_fen',
-                'movie_ids', 'brands', 'city_codes', 'hall_types',
+                'movie_ids', 'cinema_ids', 'brands', 'city_codes', 'hall_types',
                 'weekday_in', 'hour_from', 'hour_to',
                 'effective_from', 'effective_to',
             )
@@ -82,10 +82,11 @@ def _time_hit(rule, show_at):
     return True
 
 
-def resolve_markup(movie_id=None, brand=None, city_code=None, hall_type=None, show_at=None):
+def resolve_markup(movie_id=None, cinema_id=None, brand=None, city_code=None, hall_type=None, show_at=None):
     """返回 (mode, rate: float, flat_fen: int)。无命中走全局兜底。
 
-    入参为一次定价的上下文（影片PK / 影院品牌 / 城市码 / 影厅类型或show_type / 开场时间）。
+    入参为一次定价的上下文（影片PK / 影院PK / 影院品牌 / 城市码 / 影厅类型或show_type / 开场时间）。
+    cinema_id 为内部 Cinema.id（Django 主键，非麻花 up_cinema_id），与 movie_ids 同口径。
     """
     fallback_row = None
     for rule in _load_rules():
@@ -93,6 +94,8 @@ def resolve_markup(movie_id=None, brand=None, city_code=None, hall_type=None, sh
             fallback_row = rule
             continue
         if not _dim_hit(rule['movie_ids'], movie_id):
+            continue
+        if not _dim_hit(rule['cinema_ids'], cinema_id):
             continue
         if not _dim_hit(rule['brands'], brand):
             continue
@@ -141,6 +144,7 @@ def resolve_for_schedule(schedule):
     cinema = Cinema.objects.filter(id=schedule.cinema_id).first()
     return resolve_markup(
         movie_id=schedule.movie_id,
+        cinema_id=schedule.cinema_id,
         brand=cinema.brand if cinema else None,
         city_code=cinema.city_code if cinema else None,
         hall_type=schedule.show_type,

@@ -137,6 +137,7 @@ def rules_preview(request):
     else:
         mode, rate, flat_fen = markup.resolve_markup(
             movie_id=request.data.get('movie_id'),
+            cinema_id=request.data.get('cinema_id'),
             brand=request.data.get('brand'),
             city_code=request.data.get('city_code'),
             hall_type=request.data.get('hall_type'),
