@@ -1,6 +1,8 @@
 """order 视图。"""
 import logging
+from datetime import timedelta
 
+from django.db.models import Q
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
 from rest_framework import serializers
@@ -47,6 +49,10 @@ def create_order(request):
 def order_detail(request, order_id):
     """订单详情。"""
     order = services.query_order(order_id, user_id=request.user_id)
+    # 看过即灭：进入详情即标记该单通知已读（清退款到账"新"角标），条件更新幂等
+    if not order.is_read:
+        TicketOrder.objects.filter(id=order.id, is_read=0).update(is_read=1)
+        order.is_read = 1
     data = OrderSerializer(order).data
     tickets = Ticket.objects.filter(order_id=order_id)
     data['tickets'] = TicketSerializer(tickets, many=True).data
@@ -94,12 +100,54 @@ def _months_ago(months):
 
 @api_view(['GET'])
 def order_count(request):
-    """我的订单四态计数（供「我的」页角标）。"""
+    """「我的」页订单分级计数（角标 + 待办数）。
+
+    分级口径（配合订单提醒重设计）：
+      - paying        待付款(未超时)  -> 强提醒红色数字
+      - ticketing     出票中          -> 进度灰点（不催）
+      - wait_pick     待取票          -> 强提醒红色数字
+      - refunded_unread 退款到账未读  -> 弱提醒"新"字（进详情即清）
+      - todo          待办数 = paying + wait_pick -> tabBar「我的」角标
+    历史单（已完成 / 已读退款）不计入任何角标。待付款排除已超时未关单的陈旧单。
+    """
+    now = timezone.now()
+    deadline = now - timedelta(seconds=services.pay_timeout_seconds())
     base = TicketOrder.objects.filter(user_id=request.user_id, deleted=0)
+    paying = base.filter(status=TicketOrder.STATUS_PAYING, created_at__gte=deadline).count()
+    ticketing = base.filter(status=TicketOrder.STATUS_DISPATCHING).count()
+    wait_pick = base.filter(status=TicketOrder.STATUS_WAIT_PICK).count()
+    refunded_unread = base.filter(status=TicketOrder.STATUS_REFUNDED, is_read=0).count()
     return ok({
-        tab: base.filter(status__in=statuses).count()
-        for tab, statuses in ORDER_TAB_STATUS.items()
+        'paying': paying,
+        'ticketing': ticketing,
+        'wait_pick': wait_pick,
+        'refunded_unread': refunded_unread,
+        'todo': paying + wait_pick,
     })
+
+
+@api_view(['GET'])
+def order_todo(request):
+    """「我的」页待办卡：待付款(未超时) + 待取票，按紧急度排序，最多 5 条。
+
+    排序：待付款优先（越接近超时越靠前，按 created_at 升序），其后待取票（按开场时间升序）。
+    返回项复用 OrderSerializer，前端取 payRemainSeconds 做倒计时、showTime/movieName 做展示。
+    """
+    now = timezone.now()
+    deadline = now - timedelta(seconds=services.pay_timeout_seconds())
+    qs = TicketOrder.objects.filter(user_id=request.user_id, deleted=0).filter(
+        Q(status=TicketOrder.STATUS_PAYING, created_at__gte=deadline)
+        | Q(status=TicketOrder.STATUS_WAIT_PICK)
+    )
+    items = list(qs)
+
+    def _key(o):
+        if o.status == TicketOrder.STATUS_PAYING:
+            return (0, o.created_at)
+        return (1, o.show_start_at or o.created_at)
+
+    items.sort(key=_key)
+    return ok(OrderSerializer(items[:5], many=True).data)
 
 
 @api_view(['GET'])
