@@ -1,4 +1,5 @@
 """order 序列化器。"""
+from django.utils import timezone
 from rest_framework import serializers
 
 from apps.order.models import TicketOrder, Ticket
@@ -14,14 +15,18 @@ class OrderSerializer(serializers.ModelSerializer):
     statusColor = serializers.SerializerMethodField()
     payRemainSeconds = serializers.SerializerMethodField()
     upDispatchNo = serializers.SerializerMethodField()
+    canApplyRefund = serializers.SerializerMethodField()
+    showStartAt = serializers.SerializerMethodField()
 
     class Meta:
         model = TicketOrder
         fields = ['id', 'order_ext_no', 'schedule_id', 'cinema_id', 'movie_id',
                   'seats', 'seat_count', 'ticket_amount', 'service_fee',
-                  'discount_amount', 'pay_amount', 'settle_amount', 'mobile',
+                  'discount_amount', 'point_deduct', 'point_deduct_value',
+                  'pay_amount', 'settle_amount', 'mobile',
                   'status', 'statusText', 'statusColor', 'pay_status',
-                  'payRemainSeconds', 'upDispatchNo',
+                  'payRemainSeconds', 'upDispatchNo', 'canApplyRefund',
+                  'showStartAt',
                   'movieName', 'poster', 'cinemaName', 'showTime', 'created_at']
 
     _STATUS_TEXT = {
@@ -76,11 +81,28 @@ class OrderSerializer(serializers.ModelSerializer):
         return c.name if c else ''
 
     def get_showTime(self, obj):
-        from apps.catalog.models import Schedule
-        s = Schedule.objects.filter(id=obj.schedule_id).first()
-        if not s:
-            return ''
-        return s.start_at.strftime('%m-%d %H:%M')
+        """开场时间（展示口径 MM-DD HH:MM）：优先订单快照，缺失回退排片表。"""
+        from apps.order.services import order_show_start_at
+        start_at = order_show_start_at(obj)
+        return start_at.strftime('%m-%d %H:%M') if start_at else ''
+
+    def get_showStartAt(self, obj):
+        """开场时间完整时刻（ISO，前端本地兜底判断用），缺失返回空串。
+
+        项目 USE_TZ=False，库内即为本地（Asia/Shanghai）naive 时刻，
+        与 created_at 等其他时间字段序列化口径一致，直接 isoformat 输出。
+        """
+        from apps.order.services import order_show_start_at
+        start_at = order_show_start_at(obj)
+        return start_at.isoformat() if start_at else ''
+
+    def get_canApplyRefund(self, obj):
+        """是否可申请退款：出票中走拦截退款；待取票走纠纷退票（距开场>=2小时）。"""
+        from apps.order.statemachine import can_refund, can_dispute
+        try:
+            return bool(can_refund(obj) or can_dispute(obj))
+        except Exception:  # noqa: BLE001 序列化兜底：判定异常按不可退处理
+            return False
 
     def get_statusText(self, obj):
         return self._STATUS_TEXT.get(obj.status, '')

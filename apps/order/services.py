@@ -16,6 +16,14 @@ from apps.catalog.models import Schedule, Movie, Cinema
 logger = logging.getLogger('app')
 
 
+def order_show_start_at(order):
+    """订单开场时间：优先建单快照 show_start_at，缺失回退排片表；均无返回 None。"""
+    if getattr(order, 'show_start_at', None):
+        return order.show_start_at
+    return Schedule.objects.filter(
+        id=order.schedule_id).values_list('start_at', flat=True).first()
+
+
 def create_order(user_id, payload):
     """建「待支付」单。
 
@@ -81,14 +89,45 @@ def create_order(user_id, payload):
             s['salePrice'] = sale
         est_cost = est_max if buy_mode == 'kuai' else est_fast
         service_fee = 0
-        pay_amount = ticket_amount + service_fee - discount
-        if pay_amount < 0:
-            pay_amount = 0
+        goods_due = ticket_amount + service_fee - discount
+        if goods_due < 0:
+            goods_due = 0
 
         # 联调开关：环境变量强制实付金额（如 1 分钱走真实微信支付→放单全链路）
         from django.conf import settings as dj_settings
         override_fen = int(getattr(dj_settings, 'PAY_AMOUNT_OVERRIDE_FEN', 0) or 0)
+
+        # 积分抵扣（合规：仅用户自身积分抵扣现金票款；服务端重算，绝不信任前端传值）
+        #   - 前端传 pointDeduct=期望抵扣的积分数（0=不使用）；
+        #   - 服务端按 quote_deduct 用余额/比例/最低自付/上限重算可得积分；
+        #   - pay_amount 恒为「微信现金」= goods_due − 积分抵扣金额（分）；
+        #   - override 联调态强制实付，此时不使用积分抵扣，避免二者打架。
+        from apps.distributor import services as dist_services
+        point_deduct = 0
+        point_deduct_value = 0
+        want_points = int(payload.get('pointDeduct', 0) or 0)
+        if (dist_services._points_enabled() and want_points > 0
+                and goods_due > 0 and override_fen <= 0):
+            q = dist_services.quote_deduct(goods_due, user_id)
+            fpp = q['fenPerPoint'] or 1
+            allowed = min(want_points, q['points'])
+            if allowed > 0:
+                value = int(round(allowed * fpp))
+                # 双保险：抵扣后现金自付不得低于最低自付
+                if goods_due - value < q['minSelfPay']:
+                    value = max(goods_due - q['minSelfPay'], 0)
+                    allowed = int(value // fpp) if fpp else 0
+                    value = int(round(allowed * fpp))
+            if allowed > 0:
+                point_deduct = allowed
+                point_deduct_value = value
+
+        pay_amount = goods_due - point_deduct_value
+        if pay_amount < 0:
+            pay_amount = 0
         if override_fen > 0:
+            point_deduct = 0
+            point_deduct_value = 0
             pay_amount = override_fen
 
         # 3. 落单（幂等由微信支付回调 pay_no 幂等 + 放单 outId 幂等兜底）
@@ -99,18 +138,24 @@ def create_order(user_id, payload):
             cinema_id=schedule.cinema_id,
             movie_id=schedule.movie_id,
             up_schedule_id=schedule.up_schedule_id,
+            show_start_at=schedule.start_at,
             seats_json=json.dumps(seats, ensure_ascii=False),
             seat_count=len(seats),
             ticket_amount=ticket_amount,
             service_fee=service_fee,
             discount_amount=discount,
             pay_amount=pay_amount,
+            point_deduct=point_deduct,
+            point_deduct_value=point_deduct_value,
             mobile=mobile,
             status=TicketOrder.STATUS_PAYING,
             price_rate=rate,
             est_cost_amount=est_cost or None,
             buy_mode=buy_mode,
         )
+        # 同事务内冻结抵扣积分（balance→frozen）：建单与积分占用原子，避免并发双花。
+        if point_deduct > 0:
+            dist_services.freeze_deduct(user_id, point_deduct, order.order_ext_no)
     return order
 
 
@@ -164,6 +209,13 @@ def mark_paid(order_id, pay_no, amount, callback_raw=None):
 
         # 状态迁移：待付款 -> 出票中
         transition(order, TicketOrder.STATUS_DISPATCHING)
+
+        # 支付成功即核销本单抵扣积分（frozen 正式扣减）。放在事务内：
+        # 若积分核销冲突则连同支付落库一起回滚，微信重发回调时幂等收敛。
+        if getattr(order, 'point_deduct', 0) > 0:
+            from apps.distributor import services as dist_services
+            dist_services.settle_deduct(
+                order.user_id, order.point_deduct, order.order_ext_no)
 
         # 同一事务内：本地生成放单订单 + 调用麻花放单接口 /api/movie-server/movie/put/add
         try:
@@ -254,6 +306,14 @@ def _close_expired(order):
         logger.info('超时关单跳过（状态已变更） order=%s err=%s', order.order_ext_no, exc)
         return False
     TicketOrder.objects.filter(id=order.id).update(close_reason='超时未支付自动关闭')
+    # 解冻本单冻结的抵扣积分（frozen->balance，幂等；失败不阻断关单，留痕人工补）
+    if getattr(order, 'point_deduct', 0) > 0:
+        try:
+            from apps.distributor import services as dist_services
+            dist_services.unfreeze_deduct(
+                order.user_id, order.point_deduct, order.order_ext_no)
+        except Exception as exc:  # noqa: BLE001
+            logger.error('超时关单解冻积分失败 order=%s err=%s', order.order_ext_no, exc)
     logger.info('超时未付订单已自动关闭 order=%s', order.order_ext_no)
     return True
 

@@ -102,7 +102,7 @@ class RecommendSlotSerializer(serializers.ModelSerializer):
     class Meta:
         model = RecommendSlot
         fields = ['id', 'slot_type', 'movie_id', 'movie_name', 'poster_url',
-                  'title', 'subtitle', 'cta', 'bg', 'image_url',
+                  'title', 'subtitle', 'cta', 'bg', 'image_url', 'banner_url',
                   'badge', 'badge_color', 'city_code',
                   'link_type', 'link_ref',
                   'sort', 'enabled', 'effective_from', 'effective_to',

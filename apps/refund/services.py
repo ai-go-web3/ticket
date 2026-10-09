@@ -6,7 +6,8 @@
 - 出票中(20)  --出票成功--> 待取票(30) --确认收货--> 已完成(40)
 - 出票中(20)  --拦截成功--> 退款中(70) --到账-->   已退款(80)
 - 出票中(20)  --出票失败--> 出票失败(60) --自动退--> 退款中(70) -> 已退款(80)
-- 待取票(30)  --发起纠纷(/movie/put/dispute)--> 纠纷中(90)   （仅客服/异常场景，用户入口已关闭）
+- 待取票(30)  --发起纠纷(/movie/put/dispute)--> 纠纷中(90)   （dispute_config/apply_dispute，
+                                                               距开场>=2小时才可发起）
 - 纠纷中(90)  --麻花同意退票(1005/1006)--> 退款中(70) -> 已退款(80)
 - 纠纷中(90)  --取消纠纷(1001/1003/1007)/判责(1002/1004/1008)--> 待取票(30)
 - 纠纷中(90)  --麻花已退票回调(ticketRefund)--> 已退款(80)
@@ -24,26 +25,28 @@ from django.db import transaction
 from apps.common.response import BizError, ErrorCode
 from apps.common.utils import gen_refund_no
 from apps.order.models import TicketOrder, MahuaDispatch
-from apps.order.statemachine import transition, can_refund
+from apps.order.statemachine import transition, can_refund, can_dispute
 from apps.refund.models import Refund, Dispute
 
 logger = logging.getLogger('app')
 
 
+def _get_user_order(order_id, user_id):
+    """按订单ID取当前用户的未删订单，不存在抛业务异常。"""
+    try:
+        return TicketOrder.objects.get(id=order_id, user_id=user_id, deleted=0)
+    except TicketOrder.DoesNotExist:
+        raise BizError('订单不存在', code=ErrorCode.ORDER_NOT_EXIST)
+
+
 def apply_refund(user_id, order_id, reason=None):
     """申请退款（仅待出票订单，走麻花拦截）。
 
-    业务规则：任何订单不允许改签；仅「出票中」（待出票，尚未拿到票）订单
-    允许退票——先调麻花拦截成功，再对用户退款。已出票（待取票/已完成）及
-    其他状态一律拒绝。
-
-    _dispute_refund（纠纷退票）不再由用户退款入口触发，仅供客服/异常场景
-    手工调用或后续开放。
+    业务规则：任何订单不允许改签；「出票中」（待出票，尚未拿到票）订单
+    允许退票——先调麻花拦截成功，再对用户退款。
+    「待取票」订单走纠纷退票，入口见 dispute_config / apply_dispute。
     """
-    try:
-        order = TicketOrder.objects.get(id=order_id, user_id=user_id, deleted=0)
-    except TicketOrder.DoesNotExist:
-        raise BizError('订单不存在', code=ErrorCode.ORDER_NOT_EXIST)
+    order = _get_user_order(order_id, user_id)
 
     if not can_refund(order):
         raise BizError(
@@ -52,6 +55,175 @@ def apply_refund(user_id, order_id, reason=None):
         )
 
     return _intercept_refund(order, reason)
+
+
+def dispute_config(order_id, user_id):
+    """待取票纠纷退票配置：透传麻花纠纷原因 + 本地/上游规则合成可退判定。
+
+    - 本地规则（产品策略）：待取票(30) 且距开场 >= DISPUTE_MIN_MINUTES_BEFORE_SHOW；
+    - 上游规则：麻花 dispute/config 的 rules 区间（refundable）+ 每日退票
+      时间窗 + disputeMaxCount 次数限制，任一不满足则不可退（fail-closed）；
+    - 麻花不可用时不给出可退判定，直接报错，避免用户发起后必然失败。
+    """
+    order = _get_user_order(order_id, user_id)
+
+    config = {
+        'canApplyRefund': False,
+        'blockReason': '',
+        'reasons': [],
+        'feeEstimate': 0,
+        'disputeCount': 0,
+        'disputeMaxCount': 0,
+        'refundable': False,
+    }
+
+    if order.status == TicketOrder.STATUS_DISPATCHING:
+        # 出票中订单走拦截退款，无纠纷配置
+        config['blockReason'] = '出票中订单无需纠纷退票'
+        return config
+    if not can_dispute(order):
+        config['blockReason'] = '距开场不足2小时，不支持退票'
+        return config
+
+    data = _mahua_dispute_config(order)
+    reasons = list((data or {}).get('reasons') or [])
+    fee = _evaluate_refund_fee_fen(data)
+    count = int((data or {}).get('disputeCount') or 0)
+    max_count = int((data or {}).get('disputeMaxCount') or 0)
+
+    config.update({
+        'reasons': reasons,
+        'feeEstimate': fee,
+        'disputeCount': count,
+        'disputeMaxCount': max_count,
+    })
+
+    if not reasons:
+        config['blockReason'] = '按影院规则当前时段不支持退票'
+        return config
+    if max_count and count >= max_count:
+        config['blockReason'] = '该订单已达最大退票申请次数'
+        return config
+
+    rule_block = _rule_block_reason(data, order)
+    if rule_block:
+        config['blockReason'] = rule_block
+        return config
+
+    config['canApplyRefund'] = True
+    config['refundable'] = True
+    return config
+
+
+def _mahua_dispute_config(order):
+    """调麻花纠纷原因接口（/put/dispute/config），失败抛业务异常（fail-closed）。"""
+    from apps.upadapter.token import get_token
+    from apps.upadapter.mahua import MahuaClient, SUCCESS_CODE
+
+    client = MahuaClient()
+    token = get_token()
+    code, data = client.dispute_reason(token, out_id=order.order_ext_no)
+    if code != SUCCESS_CODE:
+        logger.error('纠纷原因查询失败 order=%s code=%s', order.order_ext_no, code)
+        raise BizError('获取退票规则失败，请稍后重试', code=ErrorCode.UP_ERROR)
+    return data or {}
+
+
+def _evaluate_refund_fee_fen(data):
+    """麻花预估退票手续费（元）-> 分。"""
+    try:
+        return int(round(float(data.get('evaluateRefundFee') or 0) * 100))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _rule_block_reason(data, order):
+    """按麻花 rules 区间/每日时间窗校验当前时点是否可退，不可退返回原因。
+
+    rules[i] = {minMinutes, maxMinutes, refundable, feePerTicket, description}，
+    左闭右开 [min, max)，maxMinutes=null 代表无上限。当前时间距开场分钟数
+    落入的区间 refundable!=true 即不可退；每日 startTime~endTime 时间窗外
+    一律不可退；规则缺失/区间无命中时不放行（fail-closed）。
+    """
+    from datetime import datetime as dt
+
+    from django.utils import timezone
+
+    cfg = ((data.get('refundRuleConfig') or {}).get('refundRuleConfigPut')) or {}
+    rules = cfg.get('rules') or []
+    from apps.order.services import order_show_start_at
+    start_at = order_show_start_at(order)
+    if start_at is None:
+        return '场次信息缺失，不支持退票'
+    minutes = None
+    if start_at is not None:
+        # USE_TZ=False 时库内为 naive 时刻，统一升为 aware 再计算
+        if timezone.is_naive(start_at):
+            start_at = timezone.make_aware(start_at)
+        now = timezone.now()
+        if timezone.is_naive(now):
+            now = timezone.make_aware(now)
+        minutes = int((start_at - now).total_seconds() // 60)
+
+    # 每日可发起退票的时间窗（startTime/endTime，例 08:00:00~23:00:00）
+    start_time, end_time = cfg.get('startTime'), cfg.get('endTime')
+    if start_time and end_time:
+        try:
+            t0 = dt.strptime(str(start_time), '%H:%M:%S').time()
+            t1 = dt.strptime(str(end_time), '%H:%M:%S').time()
+            if not (t0 <= timezone.localtime().time() <= t1):
+                return f'每日 {str(start_time)[:5]}-{str(end_time)[:5]} 可申请退票，当前时段不可退'
+        except ValueError:
+            pass  # 时间窗格式异常时不拦，交给区间规则判定
+
+    hit = None
+    for rule in rules:
+        try:
+            lo = int(float(rule.get('minMinutes') or 0))
+            hi_raw = rule.get('maxMinutes')
+            hi = int(float(hi_raw)) if hi_raw is not None else None
+        except (TypeError, ValueError):
+            continue
+        if minutes >= lo and (hi is None or minutes < hi):
+            hit = rule
+            break
+    if hit is None:
+        return '按影院规则当前时段不支持退票'
+    if str(hit.get('refundable', '')).lower() != 'true':
+        return (hit.get('description') or '').strip() or '按影院规则当前时段不支持退票'
+    return None
+
+
+def apply_dispute(user_id, order_id, reason_code, content=None):
+    """用户发起纠纷退票（待取票订单，走麻花 /put/dispute）。"""
+    from apps.refund.models import Dispute
+
+    order = _get_user_order(order_id, user_id)
+
+    # 并发守卫（先于时间规则，保证提示语义准确）：同单存在进行中的纠纷/退款单时拒绝重复发起
+    if Dispute.objects.filter(
+            order_id=order.id,
+            status__in=(Dispute.STATUS_STARTED, Dispute.STATUS_PROCESSING)).exists():
+        raise BizError('已存在处理中的退票申请，请勿重复提交')
+    if Refund.objects.filter(
+            order_id=order.id,
+            status__in=(Refund.STATUS_ACCEPTED, Refund.STATUS_INTERCEPTING,
+                        Refund.STATUS_WAIT_MAHUA, Refund.STATUS_REFUNDING)).exists():
+        raise BizError('已存在处理中的退款，请勿重复提交')
+
+    if not can_dispute(order):
+        raise BizError(
+            '距开场不足2小时或当前状态不支持退票',
+            code=ErrorCode.REFUND_NOT_ALLOWED,
+        )
+
+    # 发起前用麻花实时规则再校验一次：原因必须来自纠纷原因接口（2026-01-26 起必传）
+    data = _mahua_dispute_config(order)
+    reasons = list(data.get('reasons') or [])
+    if reason_code not in reasons:
+        raise BizError('请选择有效的退票原因', code=ErrorCode.PARAM_ERROR)
+
+    return _dispute_refund(order, reason_code, content)
 
 
 def _intercept_refund(order, reason):
@@ -99,14 +271,17 @@ def _intercept_refund(order, reason):
     return refund
 
 
-def _dispute_refund(order, reason):
+def _dispute_refund(order, reason_code, content=None):
     """已出票：发起纠纷（/api/movie-server/movie/put/dispute）。
 
-    disputeReason 自 2026-01-26 起必传，取值来自【纠纷原因】接口；
-    「个人原因申请退票」会扣手续费（响应 evaluateRefundFee，单位元）。
-    麻花同意退票后由纠纷回调驱动退款。
+    disputeReason 自 2026-01-26 起必传，取值来自【纠纷原因】接口（由
+    apply_dispute 预先校验）；「个人原因申请退票」会扣手续费（响应
+    evaluateRefundFee，单位元）。麻花同意退票后由纠纷回调驱动退款。
+
+    outDisputeId 用 DP+订单号+第N次发起 生成，重试/重复提交天然幂等。
     """
     from django.conf import settings as dj_settings
+    from apps.refund.models import DisputeMsg
     from apps.upadapter.token import get_token
     from apps.upadapter.mahua import MahuaClient, SUCCESS_CODE
 
@@ -114,8 +289,9 @@ def _dispute_refund(order, reason):
     if not dispatch or not dispatch.mahua_order_no:
         raise BizError('放单信息缺失')
 
-    reason_code = '个人原因申请退票'
-    content = reason or '用户申请退票'
+    attempt = Dispute.objects.filter(order_id=order.id).count() + 1
+    out_dispute_id = f'DP{order.order_ext_no}N{attempt}'
+    content = content or f'用户申请退票：{reason_code}'
 
     client = MahuaClient()
     token = get_token()
@@ -124,6 +300,7 @@ def _dispute_refund(order, reason):
         out_id=order.order_ext_no,   # 外部单号（我方订单号）
         reason=reason_code,
         content=content,
+        out_dispute_id=out_dispute_id,
         call_back_url=dj_settings.MAHUA.get('CALLBACK_URL') or None,
     )
     if code != SUCCESS_CODE:
@@ -131,7 +308,7 @@ def _dispute_refund(order, reason):
         raise BizError('发起纠纷失败，请稍后重试', code=ErrorCode.UP_ERROR)
 
     data = data or {}
-    fee = int(round(float(data.get('evaluateRefundFee') or 0) * 100))
+    fee = _evaluate_refund_fee_fen(data)
 
     # 纠纷已受理：待取票(30) -> 纠纷中(90)，等纠纷回调驱动后续
     with transaction.atomic():
@@ -139,7 +316,7 @@ def _dispute_refund(order, reason):
             refund_ext_no=gen_refund_no(),
             order_id=order.id,
             type=Refund.TYPE_DISPUTE,
-            reason=reason,
+            reason=reason_code,
             fee=fee,
             refund_amount=max(order.pay_amount - fee, 0),
             status=Refund.STATUS_WAIT_MAHUA,
@@ -149,9 +326,11 @@ def _dispute_refund(order, reason):
             refund_id=refund.id,
             up_dispute_no=str(data.get('disputeId') or ''),
             reason_code=reason_code,
-            reason_text=reason,
+            reason_text=content,
             status=Dispute.STATUS_STARTED,
         )
+        DisputeMsg.objects.create(
+            dispute_id=dispute.id, from_role=DisputeMsg.ROLE_USER, content=content)
         transition(order, TicketOrder.STATUS_DISPUTE)
 
     logger.info(
@@ -200,6 +379,9 @@ def _do_refund_order(order, refund):
 
     transition(order, TicketOrder.STATUS_REFUNDED)
     TicketOrder.objects.filter(id=order.id).update(pay_status=TicketOrder.PAY_REFUNDED)
+    # 退款闭环：把本单已抵扣消耗的积分回冲余额（幂等、best-effort）
+    from apps.distributor import services as dist_services
+    dist_services.reverse_points_on_refund(order)
 
 
 def auto_refund_dispatch_fail(order):
@@ -284,10 +466,13 @@ def _settle_refund_to_user(order, refund):
                      refund.refund_ext_no, exc)
         return refund
     if refund.status == Refund.STATUS_ARRIVED:
+        from apps.distributor import services as dist_services
         if order.status == TicketOrder.STATUS_REFUNDING:
             transition(order, TicketOrder.STATUS_REFUNDED)
         TicketOrder.objects.filter(id=order.id).update(
             pay_status=TicketOrder.PAY_REFUNDED)
+        # 到账闭环：回冲本单抵扣积分（幂等）
+        dist_services.reverse_points_on_refund(order)
     return refund
 
 

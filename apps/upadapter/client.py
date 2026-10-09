@@ -313,13 +313,13 @@ def _handle_dispatch_event(order, status, payload):
             from apps.refund.services import auto_refund_dispatch_fail
             auto_refund_dispatch_fail(locked)
     elif status == CALLBACK_CONFIRM:
-        # 确认收货 -> 已完成（触发佣金结算）
+        # 确认收货 -> 已完成（触发积分/激励结算）
         if order.status == TicketOrder.STATUS_DISPATCHING:
             transition(order, TicketOrder.STATUS_WAIT_PICK)
         if order.status != TicketOrder.STATUS_DONE:
             transition(order, TicketOrder.STATUS_DONE)
-            from apps.distributor.services import settle_commission
-            settle_commission(order)
+            from apps.distributor.services import confirm_settle
+            confirm_settle(order)
     elif status == CALLBACK_TICKET_REFUND:
         # 已退票（票款已退回我方麻花账户）：需对用户原路退款 -> 已退款(80)
         if order.status in (TicketOrder.STATUS_REFUNDING, TicketOrder.STATUS_DISPUTE):

@@ -15,7 +15,11 @@ db_dev.sqlite3
 staticfiles/
 
 # 环境变量清单（含真实密钥，勿提交）
-cloudrun-env.json
+cloudrun-env*.json
+
+# 服务器部署环境变量与商户证书（含真实密钥，勿提交）
+deploy/.env.*
+deploy/certs/
 
 # IDE
 .idea/

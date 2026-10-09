@@ -4,6 +4,7 @@ from apps.catalog.views import (
     cities, movies, movie_detail, cinemas, cinema_areas, cinema_brands,
     schedules, schedule_seats, coming_calendar, sync_movies, home_recommends,
 )
+from apps.catalog.views_media import media_asset
 
 urlpatterns = [
     path('cities', cities),
@@ -18,4 +19,6 @@ urlpatterns = [
     path('schedules/<int:schedule_id>/seats', schedule_seats),
     # 运维：供微信云托管定时任务调用
     path('sync-movies', sync_movies),
+    # 公开图片服务：运营上传、存 MySQL 的小图（横版封面/横幅底图等），免鉴权
+    path('media/<str:key>', media_asset),
 ]

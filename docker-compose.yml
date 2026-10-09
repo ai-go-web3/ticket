@@ -1,0 +1,37 @@
+# 拼拼电影票 后端 — 云服务器单机部署（docker compose）
+# 用法：
+#   测试环境： docker compose --env-file deploy/.env.staging   up -d --build
+#   生产环境： docker compose --env-file deploy/.env.production up -d --build
+#
+# 说明：
+# - MySQL 运行在宿主机上（不进 compose），容器通过 host-gateway 访问宿主机
+#   127.0.0.1，对应 .env 里的 MYSQL_ADDRESS=host.docker.internal:3306。
+# - 商户证书放在 deploy/certs/ 下（apiclient_cert.pem / apiclient_key.pem），
+#   只读挂载进容器，entrypoint 检测不到 COS 变量会自动跳过云端拉取。
+# - 容器内 gunicorn 监听 80，映射到宿主机 127.0.0.1:8000，由宿主机上的
+#   Nginx/Caddy 反代 443 -> 8000（域名备案下来后配置，见 deploy/README.md）。
+# - 定时任务（APScheduler）在进程内运行，服务常驻 single container 即可，
+#   不要起多个副本（多副本会重复调度）。
+
+services:
+  app:
+    build: .
+    image: movie-ticket-backend
+    container_name: movie-ticket-backend
+    restart: unless-stopped
+    env_file: ${APP_ENV_FILE}
+    # 内存上限：2G 机器上与 MySQL 同机，限制应用最多 1G，
+    # 超限只杀容器（restart 自动拉起），不牵连 MySQL 和系统。
+    mem_limit: 1g
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # 微信商户 API 证书（只读）。文件由运维放置，严禁提交 git。
+      - ./deploy/certs:/app/certs:ro
+    ports:
+      - "127.0.0.1:8000:80"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"

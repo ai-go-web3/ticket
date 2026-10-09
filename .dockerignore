@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+# 服务器部署目录：环境变量与商户证书只放宿主机，严禁进镜像
+deploy/
 
 # ==== Python ====
 __pycache__/

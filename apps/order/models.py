@@ -24,12 +24,15 @@ class TicketOrder(models.Model):
     cinema_id = models.BigIntegerField(verbose_name='影院ID')
     movie_id = models.BigIntegerField(verbose_name='影片ID')
     up_schedule_id = models.CharField(max_length=64, verbose_name='麻花排片ID快照')
+    show_start_at = models.DateTimeField(null=True, verbose_name='开场时间快照(建单时)')
     seats_json = models.JSONField(verbose_name='座位快照')
     seat_count = models.SmallIntegerField(verbose_name='座位数')
     ticket_amount = models.BigIntegerField(verbose_name='票面总额(分)')
     service_fee = models.BigIntegerField(default=0, verbose_name='服务费(分)')
     discount_amount = models.BigIntegerField(default=0, verbose_name='优惠(分)')
-    pay_amount = models.BigIntegerField(verbose_name='实付(分)')
+    point_deduct = models.BigIntegerField(default=0, verbose_name='本单抵扣消耗的积分')
+    point_deduct_value = models.BigIntegerField(default=0, verbose_name='积分抵扣折算金额(分)')
+    pay_amount = models.BigIntegerField(verbose_name='实付(分,微信现金)')
     settle_amount = models.BigIntegerField(null=True, verbose_name='结算价(分)')
     # 财务快照：建单时的成本上浮费率与预估成本（Σ原始fastPrice，分）。
     # 实际成本以 settle_amount（麻花 confirmPrice）为准；est_cost 用于选座时点预估与对账差异分析。

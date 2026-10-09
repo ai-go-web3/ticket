@@ -1,4 +1,13 @@
-"""分销模型：distributor / commission_rule / commission_record / wallet / wallet_txn / withdrawal / risk_event。"""
+"""积分/分销模型：wallet(积分账户) / wallet_txn(积分流水) / deduct_rule(抵扣规则)
+  + 遗留分销表 distributor / commission_rule / commission_record / withdrawal / risk_event。
+
+现行方向 = 消费积分体系：积分以「自身消费/行为」入账（earn_consume 等），只能抵扣电影票，
+不可提现/转让/折现，获取与「是否邀请到人」无关。
+分销那套（Distributor 归因 / CommissionRecord 返佣 / CommissionRule 计佣 / Withdrawal 提现）
+属旧合规风险方案，「停用但保留」：表与历史数据留存、代码短路不写入，便于回滚。
+"""
+from decimal import Decimal
+
 from django.db import models
 
 
@@ -48,6 +57,38 @@ class CommissionRule(models.Model):
         db_table = 'commission_rule'
 
 
+class DeductRule(models.Model):
+    """积分抵扣规则（消费侧策略；积分抵扣票款的比例/下限/上限/兑换率/有效期）。"""
+    SCOPE_GLOBAL = 1
+    SCOPE_ACTIVITY = 2
+
+    name = models.CharField(max_length=64, verbose_name='规则名')
+    scope = models.SmallIntegerField(default=1, verbose_name='1全局 2活动')
+    scope_ref = models.CharField(max_length=64, null=True, blank=True, verbose_name='活动引用')
+    fen_per_point = models.DecimalField(
+        max_digits=6, decimal_places=4, default=Decimal('1.0000'),
+        verbose_name='兑换率(1积分抵扣多少分)',
+    )
+    max_deduct_ratio = models.DecimalField(
+        max_digits=5, decimal_places=4, default=Decimal('0.5000'),
+        verbose_name='单笔最高抵扣比例',
+    )
+    min_self_pay = models.BigIntegerField(default=100, verbose_name='最低自付(分)')
+    per_order_cap = models.BigIntegerField(default=0, verbose_name='单笔抵扣上限(分,0=不限)')
+    daily_deduct_cap = models.BigIntegerField(default=0, verbose_name='每人每日抵扣上限(分,0=不限)')
+    expire_days = models.IntegerField(default=365, verbose_name='积分有效期天数(0=不过期)')
+    allow_grand = models.SmallIntegerField(default=0, verbose_name='【已废弃】二级分佣开关')
+    stack_with_coupon = models.SmallIntegerField(default=0, verbose_name='可与优惠券叠加(0二选一)')
+    is_active = models.SmallIntegerField(default=1, verbose_name='启用')
+    effective_from = models.DateTimeField(null=True, blank=True, verbose_name='生效时间')
+    effective_to = models.DateTimeField(null=True, blank=True, verbose_name='失效时间')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+
+    class Meta:
+        db_table = 'deduct_rule'
+        indexes = [models.Index(fields=['scope', 'is_active'])]
+
+
 class CommissionRecord(models.Model):
     """佣金流水。"""
     TYPE_INCOME = 1
@@ -78,12 +119,20 @@ class CommissionRecord(models.Model):
 
 
 class Wallet(models.Model):
-    """分销钱包。"""
+    """积分账户（消费积分体系：balance=可用积分，只能抵扣电影票，不可提现/转让/折现）。
+
+    单位：balance/frozen/total_income 均为「积分」（兑换率见 DeductRule.fen_per_point）。
+    """
     user_id = models.BigIntegerField(unique=True, verbose_name='用户ID')
-    balance = models.BigIntegerField(default=0, verbose_name='可提余额(分)')
-    frozen = models.BigIntegerField(default=0, verbose_name='提现冻结(分)')
-    total_income = models.BigIntegerField(default=0, verbose_name='累计收入')
-    total_withdraw = models.BigIntegerField(default=0, verbose_name='累计提现')
+    balance = models.BigIntegerField(default=0, verbose_name='可用积分')
+    frozen = models.BigIntegerField(default=0, verbose_name='下单抵扣冻结(积分)')
+    total_income = models.BigIntegerField(default=0, verbose_name='累计获得积分')
+    total_withdraw = models.BigIntegerField(default=0, verbose_name='累计提现(历史遗留·停用)')
+    growth = models.BigIntegerField(default=0, verbose_name='成长值(累计获得积分·只增·驱动等级)')
+    tier = models.SmallIntegerField(default=0, verbose_name='会员等级(0~4)')
+    last_earn_date = models.DateField(null=True, blank=True, verbose_name='上次签到/入账日')
+    streak = models.IntegerField(default=0, verbose_name='连续签到天数')
+    expire_at = models.DateTimeField(null=True, blank=True, verbose_name='滚动过期锚点')
     version = models.IntegerField(default=0, verbose_name='CAS')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
@@ -93,18 +142,30 @@ class Wallet(models.Model):
 
 
 class WalletTxn(models.Model):
-    """钱包流水（只增）。"""
-    BIZ_SETTLE = 1       # 佣金结算
-    BIZ_DEDUCT = 2       # 退款扣回
-    BIZ_FREEZE = 3       # 提现冻结
-    BIZ_WITHDRAW_OK = 4  # 提现成功
-    BIZ_UNFREEZE = 5     # 提现驳回解冻
+    """积分流水（只增）。amount 单位：积分（带符号）。"""
+    BIZ_SETTLE = 1        # 获取入账（消费返/签到/任务/生日/直发…，用 scene 细分）
+    BIZ_DEDUCT = 2        # 退款回冲（订单退款把已抵扣的积分退回余额）
+    BIZ_FREEZE = 3        # 下单抵扣冻结
+    BIZ_WITHDRAW_OK = 4   # 【遗留】提现成功，积分体系不再写入
+    BIZ_UNFREEZE = 5      # 抵扣解冻（支付失败/取消）
+    BIZ_USE_OK = 6        # 抵扣核销（支付成功后正式扣减冻结）
+    BIZ_EXPIRE = 7        # 积分过期作废
 
-    wallet_id = models.BigIntegerField(verbose_name='钱包ID')
+    # 获取子类（仅 BIZ_SETTLE 使用；与「是否邀请到人」无关，全部挂自身行为）
+    SCENE_CONSUME = 1     # 消费返积分
+    SCENE_CHECKIN = 2     # 每日签到
+    SCENE_TASK = 3        # 新手/任务
+    SCENE_BIRTHDAY = 4    # 生日/会员日
+    SCENE_ADMIN = 5       # 运营后台直发（补偿/活动）
+    SCENE_EXCHANGE = 6    # 兑换（预留：积分商城出账）
+
+    wallet_id = models.BigIntegerField(verbose_name='账户ID')
     biz_type = models.SmallIntegerField(verbose_name='业务类型')
-    amount = models.BigIntegerField(verbose_name='带符号金额(分)')
+    scene = models.SmallIntegerField(null=True, blank=True, verbose_name='获取子类(仅入账用)')
+    remark = models.CharField(max_length=64, null=True, blank=True, verbose_name='展示文案')
+    amount = models.BigIntegerField(verbose_name='带符号金额(积分)')
     ref_no = models.CharField(max_length=64, null=True, verbose_name='关联单号')
-    balance_after = models.BigIntegerField(verbose_name='变动后余额')
+    balance_after = models.BigIntegerField(verbose_name='变动后余额(积分)')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
 
     class Meta:
@@ -113,7 +174,7 @@ class WalletTxn(models.Model):
 
 
 class Withdrawal(models.Model):
-    """提现单。"""
+    """提现单【遗留】：抵扣化改造后提现已停用，本表仅保留历史数据供对账/留痕，不再新增。"""
     STATUS_WAIT = 10      # 待审核
     STATUS_PAYING = 20    # 打款中
     STATUS_OK = 30        # 成功

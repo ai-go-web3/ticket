@@ -1,6 +1,6 @@
 from django.urls import path
 
-from apps.adminapi import views_auth, views_dashboard, views_orders, views_recon, views_rules, views_refdata, views_recommend
+from apps.adminapi import views_auth, views_dashboard, views_orders, views_recon, views_rules, views_refdata, views_recommend, views_media
 
 urlpatterns = [
     # 登录（唯一免鉴权）
@@ -49,4 +49,7 @@ urlpatterns = [
     path('recommend/slots/<int:slot_id>', views_recommend.slots_update),
     path('recommend/slots/<int:slot_id>/toggle', views_recommend.slots_toggle),
     path('recommend/slots/<int:slot_id>/delete', views_recommend.slots_delete),
+
+    # 图片上传（存 MySQL）：供首页装修横版封面 / 横幅底图上传
+    path('media/upload', views_media.media_upload),
 ]

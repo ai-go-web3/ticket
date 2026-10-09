@@ -29,6 +29,7 @@ def _movie_slide(slot, movie):
         'movie_id': movie.id,
         'name': movie.name,
         'poster_url': movie.poster_url or '',
+        'banner_url': slot.banner_url or '',
         'badge': slot.badge or payload.get('buy_tag') or '',
         'badge_color': slot.badge_color or 'pink',
         'buy_tag': payload.get('buy_tag') or '',

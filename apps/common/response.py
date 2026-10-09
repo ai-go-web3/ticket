@@ -39,6 +39,11 @@ class ErrorCode:
     # 分销
     WITHDRAW_INSUFFICIENT = 45001
     WITHDRAW_NOT_VERIFIED = 45002
+    WITHDRAW_DISABLED = 45003         # 提现已停用，佣金仅可抵扣电影票（观影金）
+    # 观影金抵扣
+    CREDIT_INSUFFICIENT = 45011       # 观影金余额不足
+    CREDIT_EXCEED_CAP = 45012         # 超出单笔/单日抵扣上限
+    CREDIT_BELOW_SELF_PAY = 45013     # 低于最低自付，抵扣额需下调
     # 上游
     UP_ERROR = 50000
     UP_RATE_LIMIT = 50001

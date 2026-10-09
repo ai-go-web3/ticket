@@ -1,4 +1,6 @@
 """catalog 数据模型：城市 / 影片 / 影院 / 影厅 / 排期。"""
+import uuid
+
 from django.db import models
 
 
@@ -216,7 +218,8 @@ class RecommendSection(models.Model):
 class RecommendSlot(models.Model):
     """首页推荐位轮播的一格：影片或自定义 banner（混合轮播）。
 
-    - slot_type='movie'：关联内部 Movie.id（非麻花 up_movie_id），海报/片名/角标由影片实时派生。
+    - slot_type='movie'：关联内部 Movie.id（非麻花 up_movie_id），海报/片名/角标由影片实时派生；
+      可另配 banner_url(横版封面) 供首页横版轮播使用，缺省时前端回退品牌渐变占位。
     - slot_type='banner'：使用 title/subtitle/cta + bg(渐变) 或 image_url(自定义底图)。
     - city_code：'all' 或空 = 全国；否则为麻花城市ID（与 City.city_code / MarkupRule.city_codes 同口径）。
     - enabled + sort + 生效时间窗口决定 C 端展示；软删保留审计。
@@ -238,6 +241,7 @@ class RecommendSlot(models.Model):
     cta = models.CharField(max_length=64, null=True, blank=True, verbose_name='按钮文案(banner用)')
     bg = models.CharField(max_length=255, null=True, blank=True, verbose_name='底图渐变(banner用)')
     image_url = models.CharField(max_length=512, null=True, blank=True, verbose_name='自定义底图URL')
+    banner_url = models.CharField(max_length=512, null=True, blank=True, verbose_name='横版封面URL(影片位轮播用)')
     badge = models.CharField(max_length=32, null=True, blank=True, verbose_name='角标文案')
     badge_color = models.CharField(max_length=8, default='pink', verbose_name='pink/blue/gold')
     city_code = models.CharField(max_length=16, default='all', verbose_name='all或麻花城市ID')
@@ -261,3 +265,40 @@ class RecommendSlot(models.Model):
 
     def __str__(self):
         return f'{self.id}-{self.slot_type}-{self.title or self.movie_id}'
+
+
+def _gen_media_key():
+    """MediaAsset 公开访问用的不可猜测 key（32 位 hex）。"""
+    return uuid.uuid4().hex
+
+
+class MediaAsset(models.Model):
+    """图片资源：运营上传的小图直接存 MySQL（数据量少，免外部 OSS/文件存储）。
+
+    - key：uuid4 hex，公开服务端点用它寻址（`/api/v1/catalog/media/<key>`），不可猜测。
+    - data：BinaryField（MySQL 映射为 longblob）。
+    - content_type / size：回写与校验用；服务端据 content_type 返回正确 MIME。
+    - 内容按 key 不可变，服务端可长缓存。软删/审计暂不做（量小，删除即物理删行）。
+    """
+    key = models.CharField(max_length=32, unique=True, default=_gen_media_key, verbose_name='公开key')
+    name = models.CharField(max_length=255, null=True, blank=True, verbose_name='原始文件名')
+    content_type = models.CharField(max_length=64, verbose_name='MIME')
+    size = models.IntegerField(default=0, verbose_name='字节数')
+    width = models.IntegerField(null=True, blank=True, verbose_name='宽(px)')
+    height = models.IntegerField(null=True, blank=True, verbose_name='高(px)')
+    uploaded_by = models.BigIntegerField(null=True, blank=True, verbose_name='上传管理员ID')
+    data = models.BinaryField(verbose_name='图片二进制')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+
+    class Meta:
+        db_table = 'media_asset'
+        ordering = ['-id']
+        indexes = [models.Index(fields=['key'])]
+
+    @property
+    def media_path(self):
+        """相对路径（不含域名）；存进 banner_url/image_url 供各端按已知后端域名解析。"""
+        return f'/api/v1/catalog/media/{self.key}'
+
+    def __str__(self):
+        return f'{self.key}-{self.content_type}-{self.size}B'

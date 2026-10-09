@@ -70,3 +70,34 @@ def can_refund(order):
     允许退票（走麻花拦截）。已出票（待取票）及之后状态一律不可退。
     """
     return order.status == TicketOrder.STATUS_DISPATCHING
+
+
+def can_dispute(order, now=None):
+    """待取票订单是否可发起纠纷退票。
+
+    业务规则：仅「待取票」（已出票）订单，且距开场时间不少于
+    DISPUTE_MIN_MINUTES_BEFORE_SHOW（默认 120 分钟，产品策略；麻花侧
+    rules 区间可能在发起时进一步收紧，以纠纷原因接口实时校验为准）。
+    开场时间取订单快照 show_start_at，缺失时回退排片表。
+    """
+    from datetime import timedelta
+
+    from django.conf import settings as dj_settings
+    from django.utils import timezone
+
+    if order.status != TicketOrder.STATUS_WAIT_PICK:
+        return False
+    from apps.order.services import order_show_start_at
+    start_at = order_show_start_at(order)
+    if start_at is None:
+        return False
+    if now is None:
+        now = timezone.now()
+    # USE_TZ=False 时库内为 naive 时刻，统一升为 aware 再比较（两种配置都正确）
+    if timezone.is_naive(now):
+        now = timezone.make_aware(now)
+    if timezone.is_naive(start_at):
+        start_at = timezone.make_aware(start_at)
+    min_minutes = int(getattr(
+        dj_settings, 'DISPUTE_MIN_MINUTES_BEFORE_SHOW', 120) or 120)
+    return now < start_at - timedelta(minutes=min_minutes)

@@ -187,6 +187,11 @@ REFUND_RETRY_SECONDS = int(os.environ.get('REFUND_RETRY_SECONDS', '300'))
 # 超过后退款单停留 FAIL 待人工处理。0 = 不限制重试次数。
 REFUND_RETRY_MAX_TIMES = int(os.environ.get('REFUND_RETRY_MAX_TIMES', '5'))
 
+# 待取票纠纷退票：距开场不足该分钟数（产品策略，默认 120 分钟）不显示/不允许申请退票。
+# 麻花侧 rules 区间可能在发起时进一步收紧，以纠纷原因接口实时校验为准。
+DISPUTE_MIN_MINUTES_BEFORE_SHOW = int(
+    os.environ.get('DISPUTE_MIN_MINUTES_BEFORE_SHOW', '120'))
+
 # 真实支付联调开关：强制所有订单实付金额（分）。
 # 设 PAY_AMOUNT_OVERRIDE_FEN=1 即 0.01 元走真实微信支付/放单全链路，避免联调期
 # 按票面价真金白银扣款。留空/0 = 按正常票价计费（生产必须留空或 0）。
@@ -196,6 +201,39 @@ PAY_AMOUNT_OVERRIDE_FEN = int(os.environ.get('PAY_AMOUNT_OVERRIDE_FEN', '0') or 
 # 统一先上浮该比例（0.05 = 上浮 5%），原价 price 为挂牌价不上浮。
 # 设 0 = 不上浮，按成本价直接展示/计价。
 PRICE_MARKUP_RATE = float(os.environ.get('PRICE_MARKUP_RATE', '0.05') or 0)
+
+# ===== 消费积分体系（合规方向：取代分销返佣，奖励只挂用户自身消费/行为）=====
+# 合规根基：积分不可提现/转让/折现，只能抵扣电影票；获取与「是否邀请到人」无关。
+POINTS = {
+    'ENABLED': os.environ.get('POINTS_ENABLED', 'true').lower() == 'true',
+    # 兑换率：1 积分抵扣多少「分」。默认 1 => 100 积分 = 1 元。
+    'FEN_PER_POINT': int(os.environ.get('POINT_FEN_PER_POINT', '1') or 1),
+    # 消费返积分：确认收货(DONE)后，按实付金额(分) × 比例返积分。默认 1%。
+    'CONSUME_RATE': float(os.environ.get('POINT_CONSUME_RATE', '0.01') or 0),
+    # 单笔返积分上限（积分，0=不限）。
+    'PER_ORDER_CAP': int(os.environ.get('POINT_PER_ORDER_CAP', '0') or 0),
+    # 返积分是否封顶在毛利内（保证积分成本 ⊆ 毛利，不亏本）。
+    'CAP_BY_MARGIN': os.environ.get('POINT_CAP_BY_MARGIN', 'true').lower() == 'true',
+    # 毛利系数：返积分价值(分) ≤ 毛利(分) × 该系数。默认 1.0（不超毛利）。
+    'MARGIN_FACTOR': float(os.environ.get('POINT_MARGIN_FACTOR', '1.0') or 1.0),
+    # 每人每日获取积分上限（积分，0=不限）；账户余额上限（积分，0=不限）。
+    'DAILY_EARN_CAP': int(os.environ.get('POINT_DAILY_EARN_CAP', '0') or 0),
+    'BALANCE_CAP': int(os.environ.get('POINT_BALANCE_CAP', '0') or 0),
+    # 等级表：成长值(growth, 累计获得积分, 只增)驱动；rate=该等级消费返利率。
+    # 首期 Now 只做「消费返 + 抵扣」，各等级统一用 CONSUME_RATE（等级倍率作 Next）。
+    # 若需按等级差异化，把对应 rate 改成 >0 的具体值即可（0 表示沿用 CONSUME_RATE）。
+    'TIERS': [
+        {'level': 0, 'name': '新影迷',   'growth_min': 0,     'rate': 0},
+        {'level': 1, 'name': '常客',     'growth_min': 500,   'rate': 0},
+        {'level': 2, 'name': '资深影迷', 'growth_min': 2000,  'rate': 0},
+        {'level': 3, 'name': '超级影迷', 'growth_min': 6000,  'rate': 0},
+        {'level': 4, 'name': '骨灰影迷', 'growth_min': 15000, 'rate': 0},
+    ],
+}
+
+# 分销（邀请返佣/归因/二级）合规停用开关：默认关。
+# 关=停止计佣入账与归因写入（保留表/历史数据/代码，便于回滚）；开=恢复旧分销逻辑。
+DISTRIBUTOR_ENABLED = os.environ.get('DISTRIBUTOR_ENABLED', 'false').lower() == 'true'
 
 # JWT
 JWT_EXPIRE_SECONDS = int(os.environ.get('JWT_EXPIRE_SECONDS', '7200'))
@@ -296,6 +334,12 @@ USE_TZ = False
 
 STATIC_URL = '/static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# ===== 运营上传图片（存 MySQL）体积上限 =====
+# 单图 4MB；放宽请求体内存阈值以免 multipart 上传被判 DataTooBig。
+# FILE_UPLOAD_MAX_MEMORY_SIZE 设为 4MB → 4MB 以内图片直接进内存，读取入库无需临时盘文件。
+DATA_UPLOAD_MAX_MEMORY_SIZE = int(os.environ.get('DATA_UPLOAD_MAX_MEMORY_SIZE', 5 * 1024 * 1024))
+FILE_UPLOAD_MAX_MEMORY_SIZE = int(os.environ.get('FILE_UPLOAD_MAX_MEMORY_SIZE', 4 * 1024 * 1024))
 
 # ===== 运营后台前端（admin-ui 构建产物）同域托管 =====
 # Docker 多阶段构建会把 admin-ui/dist 拷到 /app/ops_static（见 Dockerfile）；
