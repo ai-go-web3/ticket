@@ -46,6 +46,7 @@ PROTECTED_PREFIXES = (
     '/api/v1/refund',
     '/api/v1/pay/unified',
     '/api/v1/pay/mock',
+    '/api/v1/notify/quota',
     '/api/v1/auth/profile',
     '/api/v1/auth/update-profile',
     '/api/v1/auth/bind-phone',

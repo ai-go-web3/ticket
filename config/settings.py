@@ -38,6 +38,7 @@ INSTALLED_APPS = [
     'apps.distributor',    # CPS 分销
     'apps.upadapter',      # 麻花 SPI 适配层
     'apps.adminapi',       # B 端运营后台（同工程，挂 /api/v1/admin）
+    'apps.notify',         # 订阅消息通知（出票/退款 + 催付/催取票定时提醒）
 ]
 
 MIDDLEWARE = [
@@ -174,6 +175,28 @@ MAHUA = {
 
 # 订单/锁座时长（秒）
 PAY_TIMEOUT = int(os.environ.get('PAY_TIMEOUT', '900'))        # 支付 15 分钟
+
+# ===== 订阅消息通知（apps/notify）=====
+# 四类一次性订阅消息模板 id（在微信公众平台按电影票务类目申请后填入；留空=该事件不发，
+# 任务安全降级为 NO_QUOTA，属预期灰度过程）。发送时按 event 从这里取，支持后补即时生效。
+WX_SUBSCRIBE_TMPL = {
+    'pay_remind': os.environ.get('WX_SUBSCRIBE_TMPL_PAY_REMIND', ''),    # 支付倒计时提醒（催付）
+    'pickup_remind': os.environ.get('WX_SUBSCRIBE_TMPL_PICKUP_REMIND', ''),  # 开场前取票提醒（催取票）
+    'issued': os.environ.get('WX_SUBSCRIBE_TMPL_ISSUED', ''),            # 出票成功
+    'refunded': os.environ.get('WX_SUBSCRIBE_TMPL_REFUNDED', ''),        # 退款成功
+}
+# 订阅消息跳转小程序环境：formal 正式版 / trial 体验版 / developer 开发版
+WX_SUBSCRIBE_STATE = os.environ.get('WX_SUBSCRIBE_STATE', 'formal')
+# 定时提醒阈值：催付在「付款倒计时剩 N 分钟」时发；催取票在「开场前 N 分钟」时发。
+PAY_REMIND_BEFORE_MIN = int(os.environ.get('PAY_REMIND_BEFORE_MIN', '4'))
+PICKUP_REMIND_BEFORE_MIN = int(os.environ.get('PICKUP_REMIND_BEFORE_MIN', '60'))
+# 通知派发/重试定时器间隔（秒），0=关闭对应任务。
+NOTIFY_DISPATCH_SECONDS = int(os.environ.get('NOTIFY_DISPATCH_SECONDS', '60'))
+NOTIFY_RETRY_SECONDS = int(os.environ.get('NOTIFY_RETRY_SECONDS', '300'))
+# 发送失败最大重试次数与退避基数（按 retry_count 指数等待）。
+NOTIFY_RETRY_MAX = int(os.environ.get('NOTIFY_RETRY_MAX', '3'))
+NOTIFY_RETRY_BACKOFF_SECONDS = int(os.environ.get('NOTIFY_RETRY_BACKOFF_SECONDS', '300'))
+
 
 # 放单补偿轮询间隔（秒）：STATUS_PENDING 查询/重放收敛。
 # 0 = 关闭该定时任务（仍可用外部定时器调用 compensate_dispatches 替代）。

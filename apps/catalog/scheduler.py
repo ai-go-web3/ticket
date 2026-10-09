@@ -111,6 +111,25 @@ def _run_refund_reconcile_job():
         logger.info('退款对账任务：%s', res)
 
 
+@_job
+def _run_notify_dispatch_job():
+    """APScheduler 回调：派发订阅消息——扫到点(due_at<=now)的待发任务发送
+    （出票/退款即时事件 + 催付/催取票定时提醒统一在此发送，发送前复检订单状态）。"""
+    from apps.notify.services import dispatch_due
+    res = dispatch_due()
+    if res.get('picked'):
+        logger.info('订阅消息派发任务：%s', res)
+
+
+@_job
+def _run_notify_retry_job():
+    """APScheduler 回调：订阅消息发送失败重试（指数退避，超上限置终态）。"""
+    from apps.notify.services import retry_failed
+    res = retry_failed()
+    if res.get('retried'):
+        logger.info('订阅消息重试任务：%s', res)
+
+
 def _token_refresh_minutes():
     """从 settings.MAHUA['TOKEN_REFRESH']（秒）取刷新间隔分钟，<=0 表示不启用。"""
     try:
@@ -223,6 +242,27 @@ def start():
         )
         added += 1
 
+    # 订阅消息派发：扫到点的待发任务发送（出票/退款即时 + 催付/催取票定时提醒）。
+    # NOTIFY_DISPATCH_SECONDS 可调，<=0 关闭；发送前会复检订单状态，异常态自动跳过。
+    notify_dispatch_seconds = _int_setting('NOTIFY_DISPATCH_SECONDS', 60)
+    if notify_dispatch_seconds > 0:
+        sched.add_job(
+            _run_notify_dispatch_job, IntervalTrigger(seconds=notify_dispatch_seconds),
+            id='notify_dispatch', name='notify_dispatch',
+            replace_existing=True, coalesce=True, misfire_grace_time=120,
+        )
+        added += 1
+
+    # 订阅消息失败重试：指数退避重发（NOTIFY_RETRY_SECONDS 可调，<=0 关闭）。
+    notify_retry_seconds = _int_setting('NOTIFY_RETRY_SECONDS', 300)
+    if notify_retry_seconds > 0:
+        sched.add_job(
+            _run_notify_retry_job, IntervalTrigger(seconds=notify_retry_seconds),
+            id='notify_retry', name='notify_retry',
+            replace_existing=True, coalesce=True, misfire_grace_time=300,
+        )
+        added += 1
+
     if added == 0:
         logger.warning('无任何定时任务需要注册，调度器未启动')
         return None
@@ -232,13 +272,15 @@ def start():
     logger.info(
         '内置定时器已启动：token_refresh=%smin coming_pull=%smin '
         'dispatch_compensation=%ss dispatch_query=%ss refund_retry=%ss '
-        'refund_reconcile=%ss tz=%s',
+        'refund_reconcile=%ss notify_dispatch=%ss notify_retry=%ss tz=%s',
         refresh_min if mahua_configured else 'off',
         coming_min if mahua_configured else 'off',
         dispatch_sync_seconds if mahua_configured else 'off',
         dispatch_query_seconds if mahua_configured else 'off',
         refund_retry_seconds,
         refund_reconcile_seconds,
+        notify_dispatch_seconds,
+        notify_retry_seconds,
         tz,
     )
     return sched

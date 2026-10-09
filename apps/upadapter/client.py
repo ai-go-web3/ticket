@@ -365,11 +365,13 @@ def query_dispatching_orders(limit=100):
 
 
 def _on_ticketed(order, data):
-    """出票成功：回填票券 + 状态迁移。"""
+    """出票成功：回填票券 + 状态迁移 + 入队「出票成功」订阅消息。"""
     from apps.order.models import Ticket
 
+    transitioned = False
     if order.status == TicketOrder.STATUS_DISPATCHING:
         transition(order, TicketOrder.STATUS_WAIT_PICK)
+        transitioned = True
 
     tickets = data.get('tickets') or []
     real_seats = data.get('realSeats')
@@ -389,6 +391,13 @@ def _on_ticketed(order, data):
         ))
     if objs:
         Ticket.objects.bulk_create(objs)
+
+    # 出票成功通知：仅首次由「出票中」迁移到「待取票」时入队一次（幂等，
+    # 后续 updateTicket 再回调时 status 已非出票中，不重复入队）。票已在此处落库，
+    # 发送时现查取票码即可。异常吞掉，绝不影响出票主流程。
+    if transitioned:
+        from apps.notify import services as notify_services
+        notify_services.enqueue_issued(order)
 
 
 def compensate_dispatches(limit=50):

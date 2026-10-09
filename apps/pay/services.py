@@ -343,6 +343,10 @@ def _reconcile_order_on_refund(refund, arrived):
                 pay_status=TicketOrder.PAY_REFUNDED)
         # 到账闭环：回冲本单抵扣积分（幂等）
         dist_services.reverse_points_on_refund(order)
+        # 退款到账通知：仅真正到账（arrived=True）才发，失败不打扰用户（后台重试兜底）。
+        # 快照退款金额/原因，入队幂等(event+order 唯一)。异常吞掉不影响回调解密链路。
+        from apps.notify import services as notify_services
+        notify_services.enqueue_refunded(order, refund=refund)
     else:
         if order.status == TicketOrder.STATUS_REFUNDED:
             # 已退款是终态，回退需 force；受理时的乐观置位被真实结果推翻

@@ -156,6 +156,11 @@ def create_order(user_id, payload):
         # 同事务内冻结抵扣积分（balance→frozen）：建单与积分占用原子，避免并发双花。
         if point_deduct > 0:
             dist_services.freeze_deduct(user_id, point_deduct, order.order_ext_no)
+
+        # 订阅消息：入队「催付」定时提醒（到点=付款倒计时剩 ~N 分钟，发送前复检是否仍未支付）。
+        # 走 on_commit：建单事务提交后才落任务，避免回滚单也发通知；通知异常已在服务内吞掉。
+        from apps.notify import services as notify_services
+        transaction.on_commit(lambda: notify_services.enqueue_pay_remind(order))
     return order
 
 
@@ -228,6 +233,12 @@ def mark_paid(order_id, pay_no, amount, callback_raw=None):
                 logger.warning(
                     '放单未完成（已即时收敛：重放一次，仍失败已转出票失败退款） order=%s mahua_no=%s',
                     order.order_ext_no, mahua_no)
+
+        # 订阅消息：入队「开场前取票」提醒（到点=开场前 ~N 分钟）。此刻票尚未出，
+        # 取票码发送时现查；发送前复检订单仍为「待取票」且未过开场，否则自动跳过。
+        # 放单成败都不影响入队——复检兜底。走 on_commit 保证支付事务提交后才落任务。
+        from apps.notify import services as notify_services
+        transaction.on_commit(lambda: notify_services.enqueue_pickup_remind(order))
     return order
 
 
