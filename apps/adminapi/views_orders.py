@@ -24,6 +24,7 @@ STATUS_LABELS = {
     TicketOrder.STATUS_PAYING: '待付款',
     TicketOrder.STATUS_DISPATCHING: '出票中',
     TicketOrder.STATUS_WAIT_PICK: '待取票',
+    TicketOrder.STATUS_SCREENED: '已放映',
     TicketOrder.STATUS_DONE: '已完成',
     TicketOrder.STATUS_CLOSED: '已关闭',
     TicketOrder.STATUS_DISPATCH_FAIL: '出票失败',
@@ -96,7 +97,7 @@ def orders(request):
 @authentication_classes(_AUTH)
 @permission_classes(_PERM)
 def orders_status_count(request):
-    """顶部 9 状态胶囊条数（与列表同筛选，但忽略 status 本身）。"""
+    """顶部各状态胶囊条数（与列表同筛选，但忽略 status 本身）。"""
     qs = _apply_filters(request, include_status=False)
     counts = {r['status']: r['n'] for r in qs.values('status').annotate(n=Count('id'))}
     out = [{'status': s, 'label': STATUS_LABELS[s], 'count': counts.get(s, 0)}

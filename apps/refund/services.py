@@ -3,7 +3,8 @@
 完整状态链路（配合 apps/order/statemachine.py）：
 - 待付款(10)  --取消订单--> 已关闭(50)            （apps/order/views.cancel_order）
 - 待付款(10)  --支付成功--> 出票中(20)            （apps/order/services.mark_paid）
-- 出票中(20)  --出票成功--> 待取票(30) --确认收货--> 已完成(40)
+- 出票中(20)  --出票成功--> 待取票(30) --(开场+缓冲,定时任务)--> 已放映(35, 终态;消费返积分在此入账)
+                 （已完成(40) 保留为历史/兼容终态；麻花 confirmSuccess 仅回补结算价不改状态，新单不再进入）
 - 出票中(20)  --拦截成功--> 退款中(70) --到账-->   已退款(80)
 - 出票中(20)  --出票失败--> 出票失败(60) --自动退--> 退款中(70) -> 已退款(80)
 - 待取票(30)  --发起纠纷(/movie/put/dispute)--> 纠纷中(90)   （dispute_config/apply_dispute，
@@ -379,9 +380,6 @@ def _do_refund_order(order, refund):
 
     transition(order, TicketOrder.STATUS_REFUNDED)
     TicketOrder.objects.filter(id=order.id).update(pay_status=TicketOrder.PAY_REFUNDED)
-    # 退款闭环：把本单已抵扣消耗的积分回冲余额（幂等、best-effort）
-    from apps.distributor import services as dist_services
-    dist_services.reverse_points_on_refund(order)
 
 
 def auto_refund_dispatch_fail(order):
@@ -466,13 +464,10 @@ def _settle_refund_to_user(order, refund):
                      refund.refund_ext_no, exc)
         return refund
     if refund.status == Refund.STATUS_ARRIVED:
-        from apps.distributor import services as dist_services
         if order.status == TicketOrder.STATUS_REFUNDING:
             transition(order, TicketOrder.STATUS_REFUNDED)
         TicketOrder.objects.filter(id=order.id).update(
             pay_status=TicketOrder.PAY_REFUNDED)
-        # 到账闭环：回冲本单抵扣积分（幂等）
-        dist_services.reverse_points_on_refund(order)
     return refund
 
 

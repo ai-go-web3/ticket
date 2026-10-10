@@ -1,6 +1,6 @@
 from django.urls import path
 
-from apps.adminapi import views_auth, views_dashboard, views_orders, views_recon, views_rules, views_refdata, views_recommend, views_media
+from apps.adminapi import views_auth, views_dashboard, views_orders, views_recon, views_rules, views_refdata, views_recommend, views_media, views_points_mall, views_member_level
 
 urlpatterns = [
     # 登录（唯一免鉴权）
@@ -49,6 +49,26 @@ urlpatterns = [
     path('recommend/slots/<int:slot_id>', views_recommend.slots_update),
     path('recommend/slots/<int:slot_id>/toggle', views_recommend.slots_toggle),
     path('recommend/slots/<int:slot_id>/delete', views_recommend.slots_delete),
+
+    # 积分商城（Story D）· 商品 CRUD / 上下架 / 调库存 / 兑换流水 / 看板
+    path('points-mall/items', views_points_mall.items_list),
+    path('points-mall/items/create', views_points_mall.items_create),
+    path('points-mall/items/<int:item_id>', views_points_mall.item_detail),
+    path('points-mall/items/<int:item_id>/update', views_points_mall.item_update),
+    path('points-mall/items/<int:item_id>/publish', views_points_mall.item_publish),
+    path('points-mall/items/<int:item_id>/unpublish', views_points_mall.item_unpublish),
+    path('points-mall/items/<int:item_id>/adjust-stock', views_points_mall.item_adjust_stock),
+    path('points-mall/items/<int:item_id>/delete', views_points_mall.item_delete),
+    path('points-mall/redemptions', views_points_mall.redemptions),
+    path('points-mall/dashboard', views_points_mall.dashboard),
+
+    # 会员等级配置 · 成长值 → 等级 → 消费返利率（取代 settings.POINTS['TIERS']）
+    path('member-levels', views_member_level.levels_list),
+    path('member-levels/create', views_member_level.levels_create),
+    path('member-levels/<int:level_id>', views_member_level.level_detail),
+    path('member-levels/<int:level_id>/update', views_member_level.level_update),
+    path('member-levels/<int:level_id>/toggle', views_member_level.level_toggle),
+    path('member-levels/<int:level_id>/delete', views_member_level.level_delete),
 
     # 图片上传（存 MySQL）：供首页装修横版封面 / 横幅底图上传
     path('media/upload', views_media.media_upload),

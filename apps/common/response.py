@@ -44,6 +44,18 @@ class ErrorCode:
     CREDIT_INSUFFICIENT = 45011       # 观影金余额不足
     CREDIT_EXCEED_CAP = 45012         # 超出单笔/单日抵扣上限
     CREDIT_BELOW_SELF_PAY = 45013     # 低于最低自付，抵扣额需下调
+    # 积分商城兑换（46xxx 段；注意 PRD 早期草拟的 40001-40005 与 PARAM_ERROR=40001 冲突，落地改用独立段）
+    MALL_POINT_INSUFFICIENT = 46001   # 积分不足
+    MALL_STOCK_EMPTY = 46002          # 库存不足 / 已兑完
+    MALL_DAILY_LIMIT = 46003          # 超每日同品类兑换上限
+    MALL_ITEM_OFFLINE = 46004         # 商品已下架
+    MALL_REDEEM_FAILED = 46005        # 兑换失败（兜底/并发冲突）
+    MALL_NOT_FOUND = 46006            # 商品不存在
+    # 会员等级配置（46010+ 段；46007-46009 预留 MALL 后续扩展）
+    MEMBER_LEVEL_NOT_FOUND = 46010    # 等级不存在
+    MEMBER_LEVEL_DUP = 46011          # 等级序号重复
+    MEMBER_LEVEL_GROWTH_ORDER = 46012 # 门槛需高于低阶 · 递增
+    MEMBER_LEVEL_LAST_ACTIVE = 46013  # 至少保留一档启用
     # 上游
     UP_ERROR = 50000
     UP_RATE_LIMIT = 50001

@@ -2,7 +2,9 @@
 from rest_framework import serializers
 
 from apps.catalog.models import MarkupRule, Movie, RecommendSection, RecommendSlot
+from apps.distributor.models import MemberLevel
 from apps.order.serializers import OrderSerializer
+from apps.points.models import MallItem
 
 
 class AdminLoginSerializer(serializers.Serializer):
@@ -151,4 +153,93 @@ class RecommendSlotSerializer(serializers.ModelSerializer):
         if link_type not in self.LINK_TYPES:
             raise serializers.ValidationError({'link_type': '不支持的跳转类型'})
 
+        return attrs
+
+
+class MallItemSerializer(serializers.ModelSerializer):
+    """积分商城商品（权益）后台 CRUD。
+
+    - stock=剩余库存，stock_total=上架总库存；sold/stock_status/category_text 为派生只读。
+    - 新建时若未显式给 stock，视图层会用 stock_total 兜底（初始即满库存）。
+    - points_price/origin_price_fen 单位：积分 / 分；expire_days 券有效期；daily_limit 每人每日同品类上限（0=不限）。
+    """
+
+    sold = serializers.IntegerField(read_only=True)
+    stock_status = serializers.CharField(read_only=True)
+    category_text = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MallItem
+        fields = ['id', 'name', 'category', 'category_text', 'cover_url',
+                  'points_price', 'origin_price_fen',
+                  'stock_total', 'stock', 'sold', 'stock_status',
+                  'daily_limit', 'expire_days',
+                  'badge', 'description', 'notes', 'applicable',
+                  'status', 'sort', 'deleted', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'sold', 'stock_status', 'created_at', 'updated_at']
+
+    def get_category_text(self, obj):
+        return MallItem.CAT_TEXT.get(obj.category, '')
+
+    def validate_category(self, value):
+        if value not in MallItem.CAT_TEXT:
+            raise serializers.ValidationError('非法品类')
+        return value
+
+    def validate(self, attrs):
+        points = attrs.get('points_price', self.instance.points_price if self.instance else None)
+        if points is not None and int(points) <= 0:
+            raise serializers.ValidationError({'points_price': '兑换积分需为正数'})
+        expire = attrs.get('expire_days', self.instance.expire_days if self.instance else 30)
+        if int(expire) <= 0:
+            raise serializers.ValidationError({'expire_days': '有效期需为正数(天)'})
+        daily = attrs.get('daily_limit', self.instance.daily_limit if self.instance else 0)
+        if int(daily) < 0:
+            raise serializers.ValidationError({'daily_limit': '每日上限不能为负(0=不限)'})
+        total = attrs.get('stock_total', self.instance.stock_total if self.instance else 0)
+        if int(total) < 0:
+            raise serializers.ValidationError({'stock_total': '库存不能为负'})
+        return attrs
+
+
+class MemberLevelSerializer(serializers.ModelSerializer):
+    """会员等级配置（后台 CRUD）。
+
+    - level：等级序号（0 起，唯一）；growth_min：达到此成长值解锁；
+    - consume_rate：该等级消费返利率（0~1，0=沿用全局 CONSUME_RATE）；
+    - is_active：0/1；停用后 tier_by_growth 会跳过该档；
+    - 成长值仅由 earn_consume（已放映）累积，签到/任务/生日/直发不入成长值。
+    """
+
+    class Meta:
+        model = MemberLevel
+        fields = ['id', 'level', 'name', 'growth_min', 'consume_rate',
+                  'color', 'perks', 'is_active', 'sort', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def validate_level(self, value):
+        if int(value) < 0:
+            raise serializers.ValidationError('等级序号需 ≥ 0')
+        return int(value)
+
+    def validate_growth_min(self, value):
+        if int(value) < 0:
+            raise serializers.ValidationError('成长值门槛不能为负')
+        return int(value)
+
+    def validate_consume_rate(self, value):
+        v = float(value or 0)
+        if v < 0 or v >= 1:
+            raise serializers.ValidationError('消费返利率需在 [0, 1) 区间')
+        return v
+
+    def validate_is_active(self, value):
+        if int(value) not in (0, 1):
+            raise serializers.ValidationError('is_active 只能为 0 或 1')
+        return int(value)
+
+    def validate(self, attrs):
+        name = attrs.get('name', getattr(self.instance, 'name', '') or '')
+        if not str(name).strip():
+            raise serializers.ValidationError({'name': '等级名称不能为空'})
         return attrs

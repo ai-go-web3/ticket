@@ -87,7 +87,7 @@ def commissions(request):
 # ---------------------------------------------------------------------------
 @api_view(['GET'])
 def points_account(request):
-    """积分账户概览：余额/冻结/成长值/等级 + 抵扣规则。"""
+    """积分账户概览：余额/成长值/等级 + 换算率。"""
     return ok(services.get_points_account(request.user_id))
 
 
@@ -99,14 +99,6 @@ def points_transactions(request):
     except (TypeError, ValueError):
         limit = 50
     return ok(services.list_transactions(request.user_id, limit=max(1, min(limit, 200))))
-
-
-@api_view(['GET'])
-def points_quote(request):
-    """结算页试算：本单可用积分抵扣额（不落库）。amount 单位：分。"""
-    amount = int(request.query_params.get('amount', 0) or 0)
-    activity_ref = request.query_params.get('activityRef') or None
-    return ok(services.quote_deduct(amount, request.user_id, activity_ref))
 
 
 @api_view(['GET'])
@@ -126,7 +118,6 @@ def wallet(request):
         'totalIncome': data['totalIncome'], 'totalWithdraw': data['totalWithdraw'],
         'todayIncome': int(today_income),
         'fenPerPoint': data['fenPerPoint'],
-        'deductRule': data['deductRule'],
     })
 
 
@@ -134,10 +125,6 @@ def wallet(request):
 def withdraw(request):
     """申请提现（积分体系已停用，保留接口仅返回停用提示）。"""
     raise BizError(
-        '提现已停用，积分仅可抵扣电影票',
+        '提现已停用，积分仅可在积分商城兑换卡券',
         code=ErrorCode.WITHDRAW_DISABLED,
     )
-
-
-# 兼容旧路径名
-deduct_quote = points_quote

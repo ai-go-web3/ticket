@@ -1,12 +1,11 @@
-"""积分服务：账户/等级 / 消费返积分入账 / 抵扣资金流 / 遗留分销计佣（停用）。
+"""积分服务：账户/等级 / 消费返积分入账 / 积分兑换卡券 / 遗留分销计佣（停用）。
 
 现行方向 = 消费积分体系（合规：奖励只挂用户自身消费/行为，与拉人无关）：
 - 获取：earn_consume(消费返积分)；后续可扩 签到/任务/生日/后台直发（scene 细分）。
-- 抵扣生命周期：quote_deduct(试算) -> freeze_deduct(下单冻结)
-  -> settle_deduct(支付成功核销) / unfreeze_deduct(支付失败解冻)；退款回冲
-  deduct_reverse_on_refund；过期 expire_deduct。
-- 单位：钱包 balance/frozen 与流水 amount 均为「积分」；订单金额/抵扣上限等为「分」，
-  二者按 DeductRule.fen_per_point 换算（默认 1 积分 = 1 分，即 100 积分 = 1 元）。
+- 用途：仅用于积分商城兑换卡券（apps/points），不再支持抵扣购票现金（抵扣已下线）。
+- 单位：钱包 balance/frozen 与流水 amount 均为「积分」；与「分」的换算率取自
+  DeductRule.fen_per_point（默认 1 积分 = 1 分，即 100 积分 = 1 元），
+  现仅供消费返利折算与商城兑换定价使用。
 - 分销那套（归因/计佣/提现）：DISTRIBUTOR_ENABLED 开关门控，默认关（停用保留、可回滚）。
 """
 import logging
@@ -72,12 +71,33 @@ def get_wallet(user_id):
 
 
 def tier_by_growth(growth):
-    """按成长值落等级（取 settings.POINTS['TIERS']，返回 (level, name, rate)。"""
-    tiers = dj_settings.POINTS.get('TIERS') or []
+    """按成长值落等级：优先读 MemberLevel 表（运营在后台配置），表空回落 settings.POINTS['TIERS']。
+
+    返回 (level, name, rate)；rate=0 表示沿用全局 CONSUME_RATE。
+    """
+    from apps.distributor.models import MemberLevel
+
+    growth = int(growth or 0)
     base_rate = float(dj_settings.POINTS.get('CONSUME_RATE', 0) or 0)
+
+    rows = list(
+        MemberLevel.objects.filter(is_active=1).order_by('growth_min').values_list(
+            'level', 'name', 'growth_min', 'consume_rate',
+        )
+    )
+    if rows:
+        hit = (rows[0][0], rows[0][1], base_rate)  # 最低档兜底
+        for level, name, gmin, rate in rows:
+            if growth >= int(gmin or 0):
+                r = float(rate or 0) or base_rate
+                hit = (int(level), name, r)
+        return hit
+
+    # fallback：DB 表未 seed 时用 settings 硬编码（保底不炸）
+    tiers = dj_settings.POINTS.get('TIERS') or []
     hit = (0, '新影迷', base_rate)
     for t in sorted(tiers, key=lambda x: x.get('growth_min', 0)):
-        if int(growth or 0) >= int(t.get('growth_min', 0)):
+        if growth >= int(t.get('growth_min', 0)):
             rate = float(t.get('rate', 0) or 0) or base_rate
             hit = (int(t.get('level', 0)), t.get('name', ''), rate)
     return hit
@@ -111,7 +131,7 @@ def get_deduct_rule(activity_ref=None):
 
 
 def get_points_account(user_id):
-    """积分账户概览（供积分中心页）：余额/冻结/成长值/等级 + 抵扣规则展示。"""
+    """积分账户概览（供积分中心页）：余额/成长值/等级 + 换算率（供商城兑换展示）。"""
     w = get_wallet(user_id)
     rule = get_deduct_rule()
     level, name, rate = tier_by_growth(w.growth)
@@ -127,12 +147,7 @@ def get_points_account(user_id):
         'streak': w.streak,
         'fenPerPoint': _fpp(rule),
         'consumeRate': rate,
-        'deductRule': {
-            'maxDeductRatio': float(rule.max_deduct_ratio),
-            'minSelfPay': rule.min_self_pay,
-            'expireDays': rule.expire_days,
-            'fenPerPoint': _fpp(rule),
-        },
+        'expireDays': rule.expire_days,
     }
 
 
@@ -149,8 +164,10 @@ def _today_earned(wallet_id):
 
 
 @transaction.atomic
-def earn(order, points, scene, ref_no=None, remark=None, allow_zero=False):
-    """积分入账最小单元（原子 + CAS）：balance/growth/total_income 同增，重算等级，记流水。
+def earn(order, points, scene, ref_no=None, remark=None, allow_zero=False, award_growth=False):
+    """积分入账最小单元（原子 + CAS）：balance/total_income 同增；
+    award_growth=True 时同步涨 growth 并重算等级（仅 SCENE_CONSUME 走这条，
+    签到/任务/生日/后台直发等非观影场景不入成长值）。记流水。
 
     points<=0 默认跳过（不写 0 流水）；幂等由调用方（如 earn_consume 的 ref_no 去重）保证。
     """
@@ -168,18 +185,21 @@ def earn(order, points, scene, ref_no=None, remark=None, allow_zero=False):
         points = min(points, max(bal_cap - wallet.balance, 0))
     if points <= 0 and not allow_zero:
         return wallet
+    updates = {
+        'balance': F('balance') + points,
+        'total_income': F('total_income') + points,
+        'version': F('version') + 1,
+    }
+    if award_growth:
+        updates['growth'] = F('growth') + points
     updated = Wallet.objects.filter(
         user_id=wallet.user_id, version=wallet.version,
-    ).update(
-        balance=F('balance') + points,
-        growth=F('growth') + points,
-        total_income=F('total_income') + points,
-        version=F('version') + 1,
-    )
+    ).update(**updates)
     if not updated:
         raise BizError('积分更新冲突，请重试')
     wallet.refresh_from_db()
-    recalc_tier(wallet)
+    if award_growth:
+        recalc_tier(wallet)
     WalletTxn.objects.create(
         wallet_id=wallet.id, biz_type=WalletTxn.BIZ_SETTLE, scene=scene,
         amount=points, ref_no=ref_no, balance_after=wallet.balance,
@@ -190,12 +210,12 @@ def earn(order, points, scene, ref_no=None, remark=None, allow_zero=False):
 
 @transaction.atomic
 def earn_consume(order):
-    """消费返积分：确认收货(DONE)后，按订单实付现金 × 等级返利率入账。
+    """消费返积分：订单置为终态「已放映」后，按订单实付现金 × 等级返利率入账。
 
     - 只对「自身消费」返利，与是否邀请到人无关（合规根基）；
     - 封顶：不超毛利（pay_amount − settle_amount，settle 缺失则不设该上限）、单笔上限；
-    - 幂等：同单已记 SCENE_CONSUME 入账则跳过（查询/回调双路径可能重复触发 DONE）。
-    - 未确认收货前不入账，规避「下单返完就退票」白嫖；退款则回冲（见下）。
+    - 幂等：同单已记 SCENE_CONSUME 入账则跳过（扫描任务重复触发亦安全）。
+    - 未置「已放映」（观影终点）前不入账，规避「下单返完就退票」白嫖；退款则回冲（见下）。
     """
     if not _points_enabled():
         return None
@@ -220,11 +240,11 @@ def earn_consume(order):
     if points <= 0:
         return wallet
     return earn(order, points, WalletTxn.SCENE_CONSUME,
-                ref_no=order.order_ext_no, remark='消费返积分')
+                ref_no=order.order_ext_no, remark='消费返积分', award_growth=True)
 
 
 def confirm_settle(order):
-    """确认收货(DONE)统一激励入口：先做积分（现行方向）；分销计佣受开关门控（默认关）。"""
+    """终态(已放映)统一激励入口：先做消费返积分（现行方向）；分销计佣受开关门控（默认关）。"""
     if _points_enabled():
         try:
             earn_consume(order)
@@ -235,186 +255,8 @@ def confirm_settle(order):
 
 
 # ---------------------------------------------------------------------------
-# 抵扣资金流（单位：积分；订单侧金额单位：分，按 fen_per_point 换算）
+# 积分过期作废（通用货币生命周期，与卡券兑换并存；抵扣购票已下线）
 # ---------------------------------------------------------------------------
-def _today_deduct_used_points(wallet_id):
-    """当日已抵扣（含冻结中，BIZ_FREEZE 记负数）积分，用于日累计上限换算。"""
-    agg = WalletTxn.objects.filter(
-        wallet_id=wallet_id, biz_type=WalletTxn.BIZ_FREEZE,
-        created_at__date=timezone.now().date(),
-    ).aggregate(s=Sum('amount'))['s'] or 0
-    return -int(agg)  # FREEZE 负数，取正（积分）
-
-
-def quote_deduct(order_amount_fen, user_id, activity_ref=None):
-    """结算页试算：本单可用积分抵扣额（不落库）。
-
-    入参 order_amount_fen = 待抵扣的商品应付（分）。
-    抵扣金额(分) = min(余额可抵分, 订单额×最高比例, 订单额−最低自付, 单笔上限, 当日剩余额度)
-    再按兑换率折算为积分（向下取整，宁可少抵扣、多自付，保证不超余额/规则）。
-    返回 {points(积分), valueFen(实际抵扣分), selfPay(现金分), balance, ratio, minSelfPay, fenPerPoint}
-    """
-    order_amount_fen = int(order_amount_fen or 0)
-    rule = get_deduct_rule(activity_ref)
-    wallet = get_wallet(user_id)
-    fpp = _fpp(rule)
-
-    if order_amount_fen <= 0:
-        return {'points': 0, 'valueFen': 0, 'selfPay': max(order_amount_fen, 0),
-                'balance': wallet.balance, 'ratio': float(rule.max_deduct_ratio),
-                'minSelfPay': rule.min_self_pay, 'fenPerPoint': fpp}
-
-    balance_value = int(wallet.balance * fpp)  # 余额可抵扣的分上限
-    candidates = [
-        balance_value,
-        int(order_amount_fen * float(rule.max_deduct_ratio)),
-        max(order_amount_fen - rule.min_self_pay, 0),  # 保证实付 ≥ 最低自付
-    ]
-    if rule.per_order_cap:
-        candidates.append(int(rule.per_order_cap))
-    if rule.daily_deduct_cap:
-        used_fen = _today_deduct_used_points(wallet.id) * fpp
-        candidates.append(max(int(rule.daily_deduct_cap) - int(used_fen), 0))
-
-    deduct_fen = max(min(candidates), 0)
-    points = int(deduct_fen // fpp)                    # 取整到可抵扣的整积分
-    value_fen = int(round(points * fpp))               # 该整数积分对应的实际抵扣分
-    return {
-        'points': points,
-        'valueFen': value_fen,
-        'selfPay': order_amount_fen - value_fen,
-        'balance': wallet.balance,
-        'ratio': float(rule.max_deduct_ratio),
-        'minSelfPay': rule.min_self_pay,
-        'fenPerPoint': fpp,
-    }
-
-
-@transaction.atomic
-def freeze_deduct(user_id, points, ref_no):
-    """下单抵扣冻结：balance -> frozen（积分）。points<=0 直接返回。"""
-    points = int(points or 0)
-    if points <= 0:
-        return get_wallet(user_id)
-    wallet = get_wallet(user_id)
-    if wallet.balance < points:
-        raise BizError('积分余额不足', code=ErrorCode.CREDIT_INSUFFICIENT)
-    updated = Wallet.objects.filter(
-        user_id=user_id, version=wallet.version,
-    ).update(
-        balance=F('balance') - points,
-        frozen=F('frozen') + points,
-        version=F('version') + 1,
-    )
-    if not updated:
-        raise BizError('积分更新冲突，请重试')
-    wallet.refresh_from_db()
-    WalletTxn.objects.create(
-        wallet_id=wallet.id, biz_type=WalletTxn.BIZ_FREEZE,
-        amount=-points, ref_no=ref_no, balance_after=wallet.balance,
-        remark='下单抵扣冻结',
-    )
-    return wallet
-
-
-@transaction.atomic
-def settle_deduct(user_id, points, ref_no):
-    """支付成功核销：frozen 正式扣减（balance 已在冻结时减）。"""
-    points = int(points or 0)
-    if points <= 0:
-        return get_wallet(user_id)
-    wallet = get_wallet(user_id)
-    if wallet.frozen < points:
-        raise BizError('冻结积分异常', code=ErrorCode.CREDIT_INSUFFICIENT)
-    updated = Wallet.objects.filter(
-        user_id=user_id, version=wallet.version,
-    ).update(
-        frozen=F('frozen') - points,
-        version=F('version') + 1,
-    )
-    if not updated:
-        raise BizError('积分更新冲突，请重试')
-    wallet.refresh_from_db()
-    WalletTxn.objects.create(
-        wallet_id=wallet.id, biz_type=WalletTxn.BIZ_USE_OK,
-        amount=0, ref_no=ref_no, balance_after=wallet.balance,
-        remark='抵扣核销',
-    )
-    return wallet
-
-
-@transaction.atomic
-def unfreeze_deduct(user_id, points, ref_no):
-    """支付失败/取消解冻：frozen -> balance。"""
-    points = int(points or 0)
-    if points <= 0:
-        return get_wallet(user_id)
-    wallet = get_wallet(user_id)
-    if wallet.frozen < points:
-        return wallet  # 幂等：已解冻则跳过
-    updated = Wallet.objects.filter(
-        user_id=user_id, version=wallet.version,
-    ).update(
-        balance=F('balance') + points,
-        frozen=F('frozen') - points,
-        version=F('version') + 1,
-    )
-    if not updated:
-        raise BizError('积分更新冲突，请重试')
-    wallet.refresh_from_db()
-    WalletTxn.objects.create(
-        wallet_id=wallet.id, biz_type=WalletTxn.BIZ_UNFREEZE,
-        amount=points, ref_no=ref_no, balance_after=wallet.balance,
-        remark='抵扣解冻',
-    )
-    return wallet
-
-
-@transaction.atomic
-def deduct_reverse_on_refund(user_id, points, ref_no):
-    """退款回冲：把该单抵扣消耗的积分退回余额（幂等：同 ref_no 已记 BIZ_DEDUCT 则跳过）。"""
-    points = int(points or 0)
-    if points <= 0:
-        return get_wallet(user_id)
-    wallet = get_wallet(user_id)
-    if WalletTxn.objects.filter(
-            wallet_id=wallet.id, biz_type=WalletTxn.BIZ_DEDUCT, ref_no=ref_no).exists():
-        return wallet  # 已回冲，防重复退款回冲印积分
-    updated = Wallet.objects.filter(
-        user_id=user_id, version=wallet.version,
-    ).update(
-        balance=F('balance') + points,
-        version=F('version') + 1,
-    )
-    if not updated:
-        raise BizError('积分更新冲突，请重试')
-    wallet.refresh_from_db()
-    WalletTxn.objects.create(
-        wallet_id=wallet.id, biz_type=WalletTxn.BIZ_DEDUCT,
-        amount=points, ref_no=ref_no, balance_after=wallet.balance,
-        remark='退款回冲积分',
-    )
-    return wallet
-
-
-def reverse_points_on_refund(order):
-    """订单退款收敛处统一调用：把该单已核销抵扣的积分回冲余额（幂等、best-effort）。
-
-    仅在订单确有积分抵扣时动作；异常吞掉不影响退款主流程（可据流水人工补）。
-    """
-    try:
-        used = int(getattr(order, 'point_deduct', 0) or 0)
-    except Exception:  # noqa: BLE001
-        return None
-    if used <= 0:
-        return None
-    try:
-        return deduct_reverse_on_refund(order.user_id, used, order.order_ext_no)
-    except Exception as exc:  # noqa: BLE001
-        logger.error('退款回冲积分失败 order=%s err=%s', order.order_ext_no, exc)
-        return None
-
-
 @transaction.atomic
 def expire_deduct(user_id, amount, ref_no=None):
     """积分过期作废（供定时任务调用）：balance 减少并记 BIZ_EXPIRE。"""

@@ -22,7 +22,7 @@ class OrderSerializer(serializers.ModelSerializer):
         model = TicketOrder
         fields = ['id', 'order_ext_no', 'schedule_id', 'cinema_id', 'movie_id',
                   'seats', 'seat_count', 'ticket_amount', 'service_fee',
-                  'discount_amount', 'point_deduct', 'point_deduct_value',
+                  'discount_amount',
                   'pay_amount', 'settle_amount', 'mobile',
                   'status', 'statusText', 'statusColor', 'pay_status',
                   'payRemainSeconds', 'upDispatchNo', 'canApplyRefund',
@@ -33,6 +33,7 @@ class OrderSerializer(serializers.ModelSerializer):
         TicketOrder.STATUS_PAYING: '待付款',
         TicketOrder.STATUS_DISPATCHING: '出票中',
         TicketOrder.STATUS_WAIT_PICK: '待取票',
+        TicketOrder.STATUS_SCREENED: '已放映',
         TicketOrder.STATUS_DONE: '已完成',
         TicketOrder.STATUS_CLOSED: '已关闭',
         TicketOrder.STATUS_DISPATCH_FAIL: '出票失败',

@@ -48,7 +48,9 @@ def overview(range_key='7d'):
     profit = ticket_amt - settle_amt
     profit_rate = round(profit / gmv * 100, 2) if gmv else None
 
-    done = base.filter(status__in=(TicketOrder.STATUS_DONE, TicketOrder.STATUS_WAIT_PICK)).count()
+    done = base.filter(status__in=(
+        TicketOrder.STATUS_DONE, TicketOrder.STATUS_SCREENED,
+        TicketOrder.STATUS_WAIT_PICK)).count()
     fail = base.filter(status=TicketOrder.STATUS_DISPATCH_FAIL).count()
     denom = done + fail
     success_rate = round(done / denom * 100, 2) if denom else None
@@ -79,18 +81,19 @@ def trend(days=7):
 
 
 def status_count(range_key='7d'):
-    """屏1 各状态订单条数（9 态）。"""
+    """屏1 各状态订单条数（10 态）。"""
     start, end = _range_start(range_key)
     rows = (TicketOrder.objects
             .filter(deleted=0, created_at__gte=start, created_at__lt=end)
             .values('status').annotate(n=Count('id')))
     counts = {r['status']: r['n'] for r in rows}
     order = [TicketOrder.STATUS_PAYING, TicketOrder.STATUS_DISPATCHING,
-             TicketOrder.STATUS_WAIT_PICK, TicketOrder.STATUS_DONE, TicketOrder.STATUS_CLOSED,
+             TicketOrder.STATUS_WAIT_PICK, TicketOrder.STATUS_SCREENED,
+             TicketOrder.STATUS_DONE, TicketOrder.STATUS_CLOSED,
              TicketOrder.STATUS_DISPATCH_FAIL, TicketOrder.STATUS_REFUNDING,
              TicketOrder.STATUS_REFUNDED, TicketOrder.STATUS_DISPUTE]
-    labels = {10: '待付款', 20: '出票中', 30: '待取票', 40: '已完成', 50: '已关闭',
-              60: '出票失败', 70: '退款中', 80: '已退款', 90: '纠纷中'}
+    labels = {10: '待付款', 20: '出票中', 30: '待取票', 35: '已放映', 40: '已完成',
+              50: '已关闭', 60: '出票失败', 70: '退款中', 80: '已退款', 90: '纠纷中'}
     return [{'status': s, 'label': labels.get(s, str(s)), 'count': counts.get(s, 0)} for s in order]
 
 

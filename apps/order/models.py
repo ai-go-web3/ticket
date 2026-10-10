@@ -7,7 +7,9 @@ class TicketOrder(models.Model):
     STATUS_PAYING = 10      # 待支付
     STATUS_DISPATCHING = 20 # 出票中
     STATUS_WAIT_PICK = 30   # 待取票
-    STATUS_DONE = 40        # 已完成(确认收货)
+    STATUS_SCREENED = 35    # 已放映（终态：开场并留放映缓冲后由定时任务收敛，消费返积分在此入账；
+                            #            麻花后续 confirmSuccess 仅回补结算价，不再改变状态）
+    STATUS_DONE = 40        # 已完成（历史/兼容终态，新单不再进入）
     STATUS_CLOSED = 50      # 已关闭
     STATUS_DISPATCH_FAIL = 60  # 出票失败
     STATUS_REFUNDING = 70   # 退款中
@@ -30,8 +32,6 @@ class TicketOrder(models.Model):
     ticket_amount = models.BigIntegerField(verbose_name='票面总额(分)')
     service_fee = models.BigIntegerField(default=0, verbose_name='服务费(分)')
     discount_amount = models.BigIntegerField(default=0, verbose_name='优惠(分)')
-    point_deduct = models.BigIntegerField(default=0, verbose_name='本单抵扣消耗的积分')
-    point_deduct_value = models.BigIntegerField(default=0, verbose_name='积分抵扣折算金额(分)')
     pay_amount = models.BigIntegerField(verbose_name='实付(分,微信现金)')
     settle_amount = models.BigIntegerField(null=True, verbose_name='结算价(分)')
     # 财务快照：建单时的成本上浮费率与预估成本（Σ原始fastPrice，分）。

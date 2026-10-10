@@ -64,6 +64,18 @@ def _run_close_expired_job():
 
 
 @_job
+def _run_screen_orders_job():
+    """APScheduler 回调：把「待取票且已过 开场+放映缓冲」的订单置为「已放映」。
+
+    仅状态收敛（观影进度展示），不触发结算/积分——资金口径仍由麻花 confirmSuccess 驱动。
+    """
+    from apps.order.services import mark_screened_orders
+    screened = mark_screened_orders()
+    if screened:
+        logger.info('待取票->已放映收敛：%s 单', screened)
+
+
+@_job
 def _run_coming_pull_job():
     """APScheduler 回调：全量拉取待映影片（分页循环到拉空，上限 100 条）。"""
     from apps.catalog.services import run_coming_pull
@@ -187,6 +199,17 @@ def start():
     )
     added += 1
 
+    # 待取票->已放映收敛：每 5 分钟扫「已过 开场+放映缓冲」的待取票单（SCREEN_ORDERS_SECONDS
+    # 可调，<=0 关闭）。仅状态迁移，不触发结算/积分，逐单乐观锁幂等。
+    screen_seconds = _int_setting('SCREEN_ORDERS_SECONDS', 300)
+    if screen_seconds > 0:
+        sched.add_job(
+            _run_screen_orders_job, IntervalTrigger(seconds=screen_seconds),
+            id='order_mark_screened', name='order_mark_screened',
+            replace_existing=True, coalesce=True, misfire_grace_time=300,
+        )
+        added += 1
+
     # 待映影片全量拉取：comingList 全国分页，循环拉到拉空（依赖麻花 token，故同样要求已配置）
     if coming_min > 0 and mahua_configured:
         sched.add_job(
@@ -271,10 +294,11 @@ def start():
     _scheduler = sched
     logger.info(
         '内置定时器已启动：token_refresh=%smin coming_pull=%smin '
-        'dispatch_compensation=%ss dispatch_query=%ss refund_retry=%ss '
-        'refund_reconcile=%ss notify_dispatch=%ss notify_retry=%ss tz=%s',
+        'close_expired=60s mark_screened=%ss dispatch_compensation=%ss dispatch_query=%ss '
+        'refund_retry=%ss refund_reconcile=%ss notify_dispatch=%ss notify_retry=%ss tz=%s',
         refresh_min if mahua_configured else 'off',
         coming_min if mahua_configured else 'off',
+        screen_seconds,
         dispatch_sync_seconds if mahua_configured else 'off',
         dispatch_query_seconds if mahua_configured else 'off',
         refund_retry_seconds,

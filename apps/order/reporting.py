@@ -89,7 +89,7 @@ def daily_report(days=7, date=None):
         if o.settle_amount is not None:
             b['settle'] += o.settle_amount
         elif o.status in (TicketOrder.STATUS_DISPATCHING, TicketOrder.STATUS_DONE,
-                          TicketOrder.STATUS_WAIT_PICK):
+                          TicketOrder.STATUS_SCREENED, TicketOrder.STATUS_WAIT_PICK):
             # 已付且在出票链路中却始终没有结算价：对账缺口
             alerts['unsettled'].append(o.order_ext_no)
         # 倒挂：实际结算高于票款收入（卖价低于成本）

@@ -97,37 +97,9 @@ def create_order(user_id, payload):
         from django.conf import settings as dj_settings
         override_fen = int(getattr(dj_settings, 'PAY_AMOUNT_OVERRIDE_FEN', 0) or 0)
 
-        # 积分抵扣（合规：仅用户自身积分抵扣现金票款；服务端重算，绝不信任前端传值）
-        #   - 前端传 pointDeduct=期望抵扣的积分数（0=不使用）；
-        #   - 服务端按 quote_deduct 用余额/比例/最低自付/上限重算可得积分；
-        #   - pay_amount 恒为「微信现金」= goods_due − 积分抵扣金额（分）；
-        #   - override 联调态强制实付，此时不使用积分抵扣，避免二者打架。
-        from apps.distributor import services as dist_services
-        point_deduct = 0
-        point_deduct_value = 0
-        want_points = int(payload.get('pointDeduct', 0) or 0)
-        if (dist_services._points_enabled() and want_points > 0
-                and goods_due > 0 and override_fen <= 0):
-            q = dist_services.quote_deduct(goods_due, user_id)
-            fpp = q['fenPerPoint'] or 1
-            allowed = min(want_points, q['points'])
-            if allowed > 0:
-                value = int(round(allowed * fpp))
-                # 双保险：抵扣后现金自付不得低于最低自付
-                if goods_due - value < q['minSelfPay']:
-                    value = max(goods_due - q['minSelfPay'], 0)
-                    allowed = int(value // fpp) if fpp else 0
-                    value = int(round(allowed * fpp))
-            if allowed > 0:
-                point_deduct = allowed
-                point_deduct_value = value
-
-        pay_amount = goods_due - point_deduct_value
-        if pay_amount < 0:
-            pay_amount = 0
+        # 积分抵扣购票已下线：积分仅用于卡券兑换，票款一律按现金支付。
+        pay_amount = goods_due
         if override_fen > 0:
-            point_deduct = 0
-            point_deduct_value = 0
             pay_amount = override_fen
 
         # 3. 落单（幂等由微信支付回调 pay_no 幂等 + 放单 outId 幂等兜底）
@@ -145,17 +117,12 @@ def create_order(user_id, payload):
             service_fee=service_fee,
             discount_amount=discount,
             pay_amount=pay_amount,
-            point_deduct=point_deduct,
-            point_deduct_value=point_deduct_value,
             mobile=mobile,
             status=TicketOrder.STATUS_PAYING,
             price_rate=rate,
             est_cost_amount=est_cost or None,
             buy_mode=buy_mode,
         )
-        # 同事务内冻结抵扣积分（balance→frozen）：建单与积分占用原子，避免并发双花。
-        if point_deduct > 0:
-            dist_services.freeze_deduct(user_id, point_deduct, order.order_ext_no)
 
         # 订阅消息：入队「催付」定时提醒（到点=付款倒计时剩 ~N 分钟，发送前复检是否仍未支付）。
         # 走 on_commit：建单事务提交后才落任务，避免回滚单也发通知；通知异常已在服务内吞掉。
@@ -214,13 +181,6 @@ def mark_paid(order_id, pay_no, amount, callback_raw=None):
 
         # 状态迁移：待付款 -> 出票中
         transition(order, TicketOrder.STATUS_DISPATCHING)
-
-        # 支付成功即核销本单抵扣积分（frozen 正式扣减）。放在事务内：
-        # 若积分核销冲突则连同支付落库一起回滚，微信重发回调时幂等收敛。
-        if getattr(order, 'point_deduct', 0) > 0:
-            from apps.distributor import services as dist_services
-            dist_services.settle_deduct(
-                order.user_id, order.point_deduct, order.order_ext_no)
 
         # 同一事务内：本地生成放单订单 + 调用麻花放单接口 /api/movie-server/movie/put/add
         try:
@@ -317,14 +277,6 @@ def _close_expired(order):
         logger.info('超时关单跳过（状态已变更） order=%s err=%s', order.order_ext_no, exc)
         return False
     TicketOrder.objects.filter(id=order.id).update(close_reason='超时未支付自动关闭')
-    # 解冻本单冻结的抵扣积分（frozen->balance，幂等；失败不阻断关单，留痕人工补）
-    if getattr(order, 'point_deduct', 0) > 0:
-        try:
-            from apps.distributor import services as dist_services
-            dist_services.unfreeze_deduct(
-                order.user_id, order.point_deduct, order.order_ext_no)
-        except Exception as exc:  # noqa: BLE001
-            logger.error('超时关单解冻积分失败 order=%s err=%s', order.order_ext_no, exc)
     logger.info('超时未付订单已自动关闭 order=%s', order.order_ext_no)
     return True
 
@@ -341,3 +293,77 @@ def close_expired_orders():
         if _close_expired(order):
             closed += 1
     return closed
+
+
+def screen_after_show_minutes():
+    """开场后到「已放映」的放映缓冲（分钟）：now >= 开场时间 + N 分钟才收敛。
+
+    取默认 150 分钟（约一场影片放映时长），避免刚开场仍在放映中就被判「已放映」，
+    也与「开场前催取票 / 距开场≥2h 可纠纷退票」窗口互不干扰。可经环境变量调节。
+    """
+    from django.conf import settings as dj_settings
+    return int(getattr(dj_settings, 'SCREEN_AFTER_SHOW_MINUTES', 150) or 0)
+
+
+def screen_order(order):
+    """把「待取票」单收敛为终态「已放映」，并在此入账消费返积分。
+
+    「已放映」即观影进度终点（不再流转到已完成）。置为已放映后调用 confirm_settle
+    发放消费返积分——earn_consume 以 order_ext_no 为 ref_no 幂等去重（同单只返一次），
+    且 confirm_settle 内部吞异常不外抛，故不会因积分侧问题影响状态收敛与整批扫描。
+
+    保证「只有待取票能转已放映」，三重锁：
+    1) 调用方 mark_screened_orders 只捞 status=待取票 的单；
+    2) transition 校验迁移表，唯 STATUS_WAIT_PICK 开 SCREENED 出边，其它态直达报错；
+    3) require_status 在 UPDATE 的 WHERE 再锁库内仍为待取票——即便并发/脏读使该行
+       已被推进（且未来若出现不升 version 的状态写入也不会被覆盖），非待取票一律跳过。
+    迁移失败（状态已变）静默返回 False，绝不阻断整批扫描。
+    """
+    from apps.order.statemachine import transition
+    try:
+        transition(order, TicketOrder.STATUS_SCREENED,
+                   require_status=TicketOrder.STATUS_WAIT_PICK)
+    except BizError as exc:  # noqa: BLE001 状态已变更：跳过该单
+        logger.info('已放映收敛跳过（状态已变更） order=%s err=%s', order.order_ext_no, exc)
+        return False
+    # 已放映终态：发放消费返积分（幂等，confirm_settle 内部已 try/except，不会抛出）
+    from apps.distributor.services import confirm_settle
+    confirm_settle(order)
+    logger.info('待取票->已放映（终态，已入积分）：开场缓冲已到 order=%s', order.order_ext_no)
+    return True
+
+
+def mark_screened_orders(limit=500):
+    """定时任务入口：扫描「待取票」且已过「开场 + 放映缓冲」的订单，置为终态「已放映」。
+
+    迁移成功后在 screen_order 内发放消费返积分（已放映即观影终点，不再等麻花确认收货）。
+    分批 + 逐单乐观锁/写时状态锁，天然幂等：已迁到「已放映」的单被查询条件排除；
+    积分以 order_ext_no 去重，重复执行不会重复入账。返回本次成功收敛数量。
+    """
+    deadline = timezone.now() - timedelta(minutes=screen_after_show_minutes())
+
+    screened = 0
+    # 1) 主路径：建单已写开场快照 show_start_at 的订单（新单必走此路，可走索引区间）
+    for order in TicketOrder.objects.filter(
+        status=TicketOrder.STATUS_WAIT_PICK, deleted=0,
+        show_start_at__isnull=False, show_start_at__lte=deadline,
+    ).order_by('show_start_at')[:limit]:
+        if screen_order(order):
+            screened += 1
+
+    # 2) 兜底：迁移 0005 之前 show_start_at 为空的历史单，按排片表回退逐单判断是否到点
+    #    （schedule_id 非外键、无法 join，故取有限候选在内存判定；存量收敛后此路趋零）
+    if screened < limit:
+        for order in TicketOrder.objects.filter(
+            status=TicketOrder.STATUS_WAIT_PICK, deleted=0,
+            show_start_at__isnull=True,
+        ).order_by('id')[:limit]:
+            start_at = order_show_start_at(order)
+            if start_at is None or start_at > deadline:
+                continue
+            if screen_order(order):
+                screened += 1
+            if screened >= limit:
+                break
+
+    return screened

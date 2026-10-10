@@ -313,13 +313,17 @@ def _handle_dispatch_event(order, status, payload):
             from apps.refund.services import auto_refund_dispatch_fail
             auto_refund_dispatch_fail(locked)
     elif status == CALLBACK_CONFIRM:
-        # 确认收货 -> 已完成（触发积分/激励结算）
+        # 已放映为终态：确认收货回调不再把订单推进到已完成，仅在带回结算价时回补
+        # settle_amount（供财务对账 / 毛利）。消费返积分改由「已放映」收敛时入账
+        # （见 apps.order.services.screen_order），此处不再触发 confirm_settle。
+        confirm_price = payload.get('confirmPrice')
+        if confirm_price is not None and order.settle_amount is None:
+            order.settle_amount = int(round(float(confirm_price) * 100))
+            order.save(update_fields=['settle_amount', 'updated_at'])
+        # 兼容：确认收货先于出票回调到达（订单仍在出票中）→ 先补到待取票，
+        # 终态与积分交由「已放映」定时扫描统一收敛，避免绕过缓冲提前定终。
         if order.status == TicketOrder.STATUS_DISPATCHING:
             transition(order, TicketOrder.STATUS_WAIT_PICK)
-        if order.status != TicketOrder.STATUS_DONE:
-            transition(order, TicketOrder.STATUS_DONE)
-            from apps.distributor.services import confirm_settle
-            confirm_settle(order)
     elif status == CALLBACK_TICKET_REFUND:
         # 已退票（票款已退回我方麻花账户）：需对用户原路退款 -> 已退款(80)
         if order.status in (TicketOrder.STATUS_REFUNDING, TicketOrder.STATUS_DISPUTE):

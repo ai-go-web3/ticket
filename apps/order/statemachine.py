@@ -1,7 +1,10 @@
 """订单状态机。
 
 集中管理订单状态迁移，禁止散落 if-else 改 status。
-状态流：待支付(10) → 出票中(20) → 待取票(30) → 已完成(40)
+状态流：待支付(10) → 出票中(20) → 待取票(30) →（开场+放映缓冲，定时任务）→
+        已放映(35，终态：观影进度终点，消费返积分在此入账)
+        —— 麻花稍后推来的 confirmSuccess 仅回补结算价，不再改变状态。
+        已完成(40) 保留为历史/兼容终态，新单不再进入。
 异常分支：已关闭(50) / 出票失败(60) / 退款中(70) → 已退款(80) / 纠纷中(90)
 """
 from apps.common.response import BizError, ErrorCode
@@ -20,11 +23,12 @@ TRANSITIONS = {
         TicketOrder.STATUS_REFUNDING,     # 出票中拦截/退款
     },
     TicketOrder.STATUS_WAIT_PICK: {
-        TicketOrder.STATUS_DONE,          # 确认收货
+        TicketOrder.STATUS_SCREENED,      # 开场+放映缓冲，定时任务收敛为已放映（终态）
         TicketOrder.STATUS_REFUNDING,     # 个人原因退票 -> 纠纷/退款
         TicketOrder.STATUS_DISPUTE,       # 进入纠纷
     },
-    TicketOrder.STATUS_DONE: set(),       # 终态
+    TicketOrder.STATUS_SCREENED: set(),   # 终态（观影进度终点；confirmSuccess 仅回补结算价不改状态）
+    TicketOrder.STATUS_DONE: set(),       # 终态（历史/兼容保留，新单不再进入）
     TicketOrder.STATUS_CLOSED: set(),     # 终态
     TicketOrder.STATUS_DISPATCH_FAIL: {
         TicketOrder.STATUS_REFUNDING,     # 出票失败自动退款
@@ -41,8 +45,13 @@ TRANSITIONS = {
 }
 
 
-def transition(order, to_status, force=False):
-    """执行状态迁移（带乐观锁 version）。"""
+def transition(order, to_status, force=False, require_status=None):
+    """执行状态迁移（带乐观锁 version）。
+
+    require_status：额外在 UPDATE 的 WHERE 里锁定「库内当前状态必须等于该值」。
+    用于批量/定时收敛场景——即使库内状态被非乐观锁路径改动（不升 version），
+    也能确保只从指定状态迁移，杜绝脏读/并发把别的状态覆盖成目标状态。
+    """
     from django.db.models import F
 
     if not force and to_status not in TRANSITIONS.get(order.status, set()):
@@ -51,9 +60,12 @@ def transition(order, to_status, force=False):
             code=ErrorCode.ORDER_STATE_ILLEGAL,
         )
 
-    updated = TicketOrder.objects.filter(
-        id=order.id, version=order.version, deleted=0,
-    ).update(status=to_status, version=F('version') + 1)
+    cond = {'id': order.id, 'version': order.version, 'deleted': 0}
+    if require_status is not None:
+        cond['status'] = require_status
+
+    updated = TicketOrder.objects.filter(**cond).update(
+        status=to_status, version=F('version') + 1)
 
     if not updated:
         raise BizError('订单状态已变更，请刷新重试', code=ErrorCode.ORDER_STATE_ILLEGAL)

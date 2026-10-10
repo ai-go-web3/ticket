@@ -150,6 +150,7 @@ class WalletTxn(models.Model):
     BIZ_UNFREEZE = 5      # 抵扣解冻（支付失败/取消）
     BIZ_USE_OK = 6        # 抵扣核销（支付成功后正式扣减冻结）
     BIZ_EXPIRE = 7        # 积分过期作废
+    BIZ_EXCHANGE = 8      # 积分商城兑换出账（amount 为负；apps/points 写入，明细归入「消耗」）
 
     # 获取子类（仅 BIZ_SETTLE 使用；与「是否邀请到人」无关，全部挂自身行为）
     SCENE_CONSUME = 1     # 消费返积分
@@ -211,3 +212,29 @@ class RiskEvent(models.Model):
     class Meta:
         db_table = 'risk_event'
         indexes = [models.Index(fields=['user_id'])]
+
+
+class MemberLevel(models.Model):
+    """会员等级配置（成长值 → 等级 → 消费返利率）。
+
+    取代旧 settings.POINTS['TIERS'] 硬编码，允许运营在后台动态调整门槛与权益。
+    成长值仅由「已放映」消费返利累积（earn_consume → earn(award_growth=True)），
+    签到 / 任务 / 生日 / 后台直发等其他 scene 不入成长值。
+    """
+    level = models.SmallIntegerField(unique=True, verbose_name='等级序号(0~N)')
+    name = models.CharField(max_length=32, verbose_name='等级名称')
+    growth_min = models.BigIntegerField(default=0, verbose_name='达到此成长值解锁')
+    consume_rate = models.DecimalField(
+        max_digits=6, decimal_places=4, default=Decimal('0'),
+        verbose_name='该等级消费返利率(0=沿用全局 CONSUME_RATE)',
+    )
+    color = models.CharField(max_length=16, blank=True, default='', verbose_name='展示色(如 #ff2f6d)')
+    perks = models.TextField(blank=True, default='', verbose_name='权益说明(纯文本/JSON 由前端约定)')
+    is_active = models.SmallIntegerField(default=1, verbose_name='1启用 0停用')
+    sort = models.IntegerField(default=0, verbose_name='排序(小→大)')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'member_level'
+        ordering = ['level']

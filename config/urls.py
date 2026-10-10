@@ -24,6 +24,7 @@ urlpatterns = [
     path('api/v1/pay/', include('apps.pay.urls')),
     path('api/v1/refund/', include('apps.refund.urls')),
     path('api/v1/distributor/', include('apps.distributor.urls')),
+    path('api/v1/mall/', include('apps.points.urls')),
     path('api/v1/notify/', include('apps.notify.urls')),
     # B 端运营后台（与内置 /admin/ 不冲突）
     path('api/v1/admin/', include('apps.adminapi.urls')),

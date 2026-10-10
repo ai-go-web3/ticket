@@ -335,14 +335,11 @@ def _reconcile_order_on_refund(refund, arrived):
     if not order:
         return
     if arrived:
-        from apps.distributor import services as dist_services
         if order.status == TicketOrder.STATUS_REFUNDING:
             transition(order, TicketOrder.STATUS_REFUNDED)
         if order.pay_status != TicketOrder.PAY_REFUNDED:
             TicketOrder.objects.filter(id=order.id).update(
                 pay_status=TicketOrder.PAY_REFUNDED)
-        # 到账闭环：回冲本单抵扣积分（幂等）
-        dist_services.reverse_points_on_refund(order)
         # 退款到账通知：仅真正到账（arrived=True）才发，失败不打扰用户（后台重试兜底）。
         # 快照退款金额/原因，入队幂等(event+order 唯一)。异常吞掉不影响回调解密链路。
         from apps.notify import services as notify_services

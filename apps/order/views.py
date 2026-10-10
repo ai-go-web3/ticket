@@ -20,7 +20,8 @@ logger = logging.getLogger('app')
 ORDER_TAB_STATUS = {
     'paying': [TicketOrder.STATUS_PAYING],                                   # 待付款
     'ticketing': [TicketOrder.STATUS_DISPATCHING],                           # 出票中
-    'issued': [TicketOrder.STATUS_WAIT_PICK, TicketOrder.STATUS_DONE],       # 已出票
+    'issued': [TicketOrder.STATUS_WAIT_PICK, TicketOrder.STATUS_SCREENED,
+               TicketOrder.STATUS_DONE],                                      # 已出票(含散场已放映)
     'refunded': [TicketOrder.STATUS_REFUNDING, TicketOrder.STATUS_REFUNDED], # 已退款
 }
 
@@ -30,8 +31,6 @@ class CreateOrderSerializer(serializers.Serializer):
     seats = serializers.ListField(child=serializers.DictField())
     mobile = serializers.CharField(required=False, allow_blank=True)
     discountAmount = serializers.IntegerField(required=False, default=0)
-    # 期望使用的抵扣积分数（服务端按余额/规则重算，绝不信任该值本身；0=不使用）
-    pointDeduct = serializers.IntegerField(required=False, default=0, min_value=0)
     # 购票方式：tehui 特惠（放单不传 model）/ kuai 快速（放单 model=1 快速通道）
     buyMode = serializers.CharField(required=False, default='tehui')
 
@@ -188,12 +187,4 @@ def cancel_order(request, order_id):
     from apps.order.statemachine import transition
     transition(order, TicketOrder.STATUS_CLOSED)
     TicketOrder.objects.filter(id=order.id).update(close_reason='用户主动取消')
-    # 解冻本单冻结的抵扣积分（幂等；失败不阻断取消）
-    if getattr(order, 'point_deduct', 0) > 0:
-        from apps.distributor import services as dist_services
-        try:
-            dist_services.unfreeze_deduct(
-                order.user_id, order.point_deduct, order.order_ext_no)
-        except Exception as exc:  # noqa: BLE001
-            logger.error('取消订单解冻积分失败 order=%s err=%s', order.order_ext_no, exc)
     return ok(None, msg='已取消')

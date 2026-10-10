@@ -36,6 +36,7 @@ INSTALLED_APPS = [
     'apps.pay',            # 微信支付
     'apps.refund',         # 退款/拦截/纠纷
     'apps.distributor',    # CPS 分销
+    'apps.points',         # 积分商城（消费积分的第二个消耗出口：权益兑换）
     'apps.upadapter',      # 麻花 SPI 适配层
     'apps.adminapi',       # B 端运营后台（同工程，挂 /api/v1/admin）
     'apps.notify',         # 订阅消息通知（出票/退款 + 催付/催取票定时提醒）
@@ -204,6 +205,12 @@ DISPATCH_SYNC_SECONDS = int(os.environ.get('DISPATCH_SYNC_SECONDS', '60'))
 # 出票轮询间隔（秒）：每 2 分钟全量查询「出票中」订单收敛放单结果。
 # 0 = 关闭该定时任务。
 DISPATCH_QUERY_SECONDS = int(os.environ.get('DISPATCH_QUERY_SECONDS', '120'))
+# 已放映扫描间隔（秒）：每 5 分钟把「待取票且已过 开场+放映缓冲」的订单置为「已放映」。
+# 仅状态收敛展示，不触发结算/积分。0 = 关闭该定时任务。
+SCREEN_ORDERS_SECONDS = int(os.environ.get('SCREEN_ORDERS_SECONDS', '300'))
+# 开场后到「已放映」的放映缓冲（分钟）：now >= 开场时间 + N 分钟才收敛，避免刚开场
+# 仍在放映中就被判已放映。默认 150 分钟（约一场影片时长），可按排片平均时长调节。
+SCREEN_AFTER_SHOW_MINUTES = int(os.environ.get('SCREEN_AFTER_SHOW_MINUTES', '150'))
 # 失败微信退款重试间隔（秒）。0 = 关闭该定时任务（退款单停 FAIL 待人工）。
 REFUND_RETRY_SECONDS = int(os.environ.get('REFUND_RETRY_SECONDS', '300'))
 # 退款失败最大自动重试次数（默认 5，每 5 分钟一次即最多重试 25 分钟）。
@@ -231,7 +238,7 @@ POINTS = {
     'ENABLED': os.environ.get('POINTS_ENABLED', 'true').lower() == 'true',
     # 兑换率：1 积分抵扣多少「分」。默认 1 => 100 积分 = 1 元。
     'FEN_PER_POINT': int(os.environ.get('POINT_FEN_PER_POINT', '1') or 1),
-    # 消费返积分：确认收货(DONE)后，按实付金额(分) × 比例返积分。默认 1%。
+    # 消费返积分：订单置为终态「已放映」后，按实付金额(分) × 比例返积分。默认 1%。
     'CONSUME_RATE': float(os.environ.get('POINT_CONSUME_RATE', '0.01') or 0),
     # 单笔返积分上限（积分，0=不限）。
     'PER_ORDER_CAP': int(os.environ.get('POINT_PER_ORDER_CAP', '0') or 0),
