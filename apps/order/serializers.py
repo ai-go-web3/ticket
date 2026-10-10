@@ -23,7 +23,7 @@ class OrderSerializer(serializers.ModelSerializer):
         fields = ['id', 'order_ext_no', 'schedule_id', 'cinema_id', 'movie_id',
                   'seats', 'seat_count', 'ticket_amount', 'service_fee',
                   'discount_amount',
-                  'pay_amount', 'settle_amount', 'mobile',
+                  'pay_amount', 'voucher_no', 'voucher_amount', 'settle_amount', 'mobile',
                   'status', 'statusText', 'statusColor', 'pay_status',
                   'payRemainSeconds', 'upDispatchNo', 'canApplyRefund',
                   'showStartAt',

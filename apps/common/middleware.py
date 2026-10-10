@@ -46,14 +46,19 @@ PROTECTED_PREFIXES = (
     '/api/v1/refund',
     '/api/v1/pay/unified',
     '/api/v1/pay/mock',
+    '/api/v1/pay/free',
     '/api/v1/notify/quota',
     '/api/v1/auth/profile',
     '/api/v1/auth/update-profile',
     '/api/v1/auth/bind-phone',
-    # 积分商城：浏览公开，兑换/券包/明细需登录（未登录前端展示 gate）
+    # 积分商城：浏览公开，兑换/券包/选券/明细需登录（未登录前端展示 gate）
     '/api/v1/mall/redeem',
     '/api/v1/mall/vouchers',
+    '/api/v1/mall/usable-vouchers',
     '/api/v1/mall/ledger',
+    # OCR 图片识别报价（C 端首页截图购票）：仅这两个子路径须登录态；
+    # 麻花回调 /api/v1/up/callback/* 仍公开无 token，故只精确保护 /api/v1/up/ocr 而非整个 /api/v1/up/。
+    '/api/v1/up/ocr',
 )
 # 受保护前缀中的豁免路径（运维接口，走 TASK_TOKEN 自鉴权）
 PROTECTED_EXEMPT_PATHS = ('/api/v1/order/finance/daily',)

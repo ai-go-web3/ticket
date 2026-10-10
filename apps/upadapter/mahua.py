@@ -156,6 +156,40 @@ class MahuaClient:
         """座位情况（实时，禁止拉取同步，限频 60/min）。"""
         return self._post('/api/movie-server/movie/info/cinema/show/seats', {'showId': show_id}, token=token)
 
+    # ---- OCR 图片识别估价（放单模式）----
+    def ocr_evaluate_price(self, token, img_base64):
+        """影院图片识别报价。img_base64 不含 data:image 前缀，≤5M。
+
+        0.01 元/次（成功返回估价才扣费）；限频 60/min 由调用方令牌桶控制（见 ocr_services）。
+        imgBase64 进 JSON 签名体（与放单普通接口同，≠接单模式图片 multipart 不签名）。
+        超时放宽到 20s（OCR 比普通接口慢）。返回 (rtnCode, rtnMsg, rtnData 归一化对象)
+        ——额外带出 rtnMsg 供上层把业务失败文案归一化成用户提示。
+        """
+        headers, body_json = self._headers({'imgBase64': img_base64}, token=token)
+        url = f'{self.base_url}/api/movie-server/movie/ocr/evaluate/price'
+        t0 = time.time()
+        resp = requests.post(url, data=body_json.encode('utf-8'), headers=headers, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        code = data.get('rtnCode')
+        msg = data.get('rtnMsg')
+        rdata = self._as_obj(data.get('rtnData'))
+        logger.info('mahua.ocr code=%s cost=%dms size=%d',
+                    code, int((time.time() - t0) * 1000), len(img_base64))
+        return code, msg, rdata
+
+    @staticmethod
+    def _as_obj(v):
+        """rtnData 兼容：线上可能已是 dict/list，也可能是 JSON 字符串（文档称字符串）。"""
+        if v is None or isinstance(v, (dict, list)):
+            return v
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except Exception:  # noqa: BLE001
+                return v
+        return v
+
     # ---- 放单 ----
     def dispatch(self, token, payload):
         """放单（下单）。payload 见字段映射 §4.1。返回 rtnData=放单号字符串。"""

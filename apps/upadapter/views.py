@@ -12,11 +12,10 @@ from django.http import JsonResponse
 from rest_framework.decorators import api_view, permission_classes, authentication_classes
 from rest_framework.permissions import AllowAny
 
-from apps.upadapter.models import MahuaCallbackLog
+from apps.upadapter.models import MahuaCallbackLog, OcrSession
 from apps.upadapter.client import on_order_callback
 
 logger = logging.getLogger('app')
-
 
 def mahua_ack(success=True, msg=None):
     """麻花回调应答：success -> rtnCode 000000，否则非成功码触发重试。
@@ -141,3 +140,57 @@ def schedule_callback(request):
 
     from apps.catalog.services import sync_schedule_callback
     return _process('schedule', dedup_key, payload, sync_schedule_callback)
+
+
+# ============ OCR 图片识别报价（C 端，须登录态）============
+# 与回调不同：这两个接口面向已登录用户，走 JWTAuthMiddleware 的 PROTECTED_PREFIXES
+# （见 apps/common/middleware.py，已把 '/api/v1/up/ocr' 加入受保护前缀）。
+# 故这里用裸 @api_view 即可——无 token 时中间件已返 401，进到视图时 request.user_id 必有效。
+from apps.common.response import ok                    # noqa: E402
+from apps.upadapter import ocr_services                # noqa: E402
+
+
+@api_view(['POST'])
+def ocr_recognize(request):
+    """上传选座截图 → 麻花 OCR 识别 → 匹配在售场次 → 上浮定价，返回识别会话。
+
+    body: {imgBase64, outBizNo?}。status 语义见 OcrSession：1 唯一可下单/2 多候选/3,4 失败。
+    成交价为麻花 evaluatePrice 经我方上浮规则加成后的 sellAmountFen（回传展示）。
+    """
+    img = (request.data.get('imgBase64') or '').strip()
+    out_biz_no = request.data.get('outBizNo') or ('ocr_' + uuid.uuid4().hex)
+    sess = ocr_services.recognize(request.user_id, out_biz_no, img)
+    failed = sess.status in (OcrSession.ST_NOMATCH, OcrSession.ST_FAIL)
+    return ok({
+        'ocrSessionId': sess.id,
+        'status': sess.status,
+        'rtnCode': sess.rtn_code,
+        'rtnMsg': sess.rtn_msg,
+        'errorStage': sess.error_stage,
+        'errorMsg': ocr_services.err_msg(sess) if failed else None,
+        'film': (sess.raw_response_json or {}).get('film'),
+        'cinema': (sess.raw_response_json or {}).get('cinema'),
+        'schedule': sess.schedule_json,
+        'seats': sess.seats_json,
+        'seatCount': sess.seat_count,
+        'faceTotalFen': sess.face_total_fen,   # 原价合计（分）
+        'sellAmountFen': sess.sell_fen,        # 上浮后售价 = 成交价/应付（分）
+        'saveFen': sess.save_fen,              # 省 = 原价 - 上浮后售价
+        'candidates': sess.candidates_json,
+        'canOrder': sess.status == OcrSession.ST_SUCCESS,
+    })
+
+
+@api_view(['POST'])
+def ocr_resolve(request):
+    """把识别会话翻译成现成 order/create 可直接消费的入参（座位补全 + 上浮成交价）。
+
+    body: {ocrSessionId, chosenIndex?}。多候选时传 chosenIndex 选定场次。
+    前端拿到 {scheduleId, seats, discountAmount} 后直接 POST /api/v1/order/create。
+    """
+    from apps.common.response import BizError, ErrorCode
+    sess_id = request.data.get('ocrSessionId')
+    if not sess_id:
+        raise BizError('缺少 ocrSessionId', code=ErrorCode.PARAM_ERROR)
+    data = ocr_services.resolve(sess_id, request.user_id, request.data.get('chosenIndex'))
+    return ok(data)

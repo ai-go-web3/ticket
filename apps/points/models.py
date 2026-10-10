@@ -41,6 +41,10 @@ class MallItem(models.Model):
     points_price = models.BigIntegerField(verbose_name='兑换所需积分')
     origin_price_fen = models.BigIntegerField(default=0, verbose_name='原价对照(分,0=无对照)')
 
+    # 代金券抵扣属性（仅 CAT_VOUCHER 有意义；兑换时快照进 Voucher，运营改此值不影响已发出的券）
+    face_value_fen = models.BigIntegerField(default=0, verbose_name='券面额(分,抵扣额)')
+    use_threshold_fen = models.BigIntegerField(default=0, verbose_name='使用门槛(分,票面应付满此额可用,0=无门槛)')
+
     # 库存：stock_total=上架总份数，stock=剩余可兑；进度条/「仅剩X份」由二者派生
     stock_total = models.IntegerField(default=0, verbose_name='上架总库存(份)')
     stock = models.IntegerField(default=0, verbose_name='剩余库存(份)')
@@ -118,11 +122,13 @@ class Voucher(models.Model):
     STATUS_UNUSED = 1      # 未使用
     STATUS_USED = 2        # 已使用
     STATUS_EXPIRED = 3     # 已过期
+    STATUS_LOCKED = 4      # 锁定中（被某笔待付款订单占用；支付成功转 USED，关单/退款释放回 UNUSED）
 
     STATUS_CHOICES = [
         (STATUS_UNUSED, '未使用'),
         (STATUS_USED, '已使用'),
         (STATUS_EXPIRED, '已过期'),
+        (STATUS_LOCKED, '锁定中'),
     ]
 
     voucher_no = models.CharField(max_length=64, unique=True, verbose_name='券码')
@@ -131,6 +137,12 @@ class Voucher(models.Model):
     item_id = models.BigIntegerField(verbose_name='商品ID')
     item_name = models.CharField(max_length=64, verbose_name='权益名称快照')
     category = models.SmallIntegerField(verbose_name='品类')
+
+    # 抵扣快照（兑换时从 MallItem 写入，之后不随商品变更；仅代金券有值）
+    value_fen = models.BigIntegerField(default=0, verbose_name='券面额快照(分)')
+    threshold_fen = models.BigIntegerField(default=0, verbose_name='使用门槛快照(分,0=无门槛)')
+    # 占用/核销所在订单：LOCKED/USED 期间记录 order_ext_no，回滚时清空
+    order_ext_no = models.CharField(max_length=64, blank=True, default='', verbose_name='占用/核销订单号')
 
     status = models.SmallIntegerField(default=STATUS_UNUSED, verbose_name='状态')
     expire_at = models.DateTimeField(verbose_name='过期时间')
@@ -143,6 +155,7 @@ class Voucher(models.Model):
         indexes = [
             models.Index(fields=['user_id', 'status']),
             models.Index(fields=['expire_at']),
+            models.Index(fields=['order_ext_no']),
         ]
 
     def __str__(self):

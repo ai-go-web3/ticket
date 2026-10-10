@@ -59,6 +59,14 @@ class ErrorCode:
     # 上游
     UP_ERROR = 50000
     UP_RATE_LIMIT = 50001
+    # 识图购票（截图 OCR）
+    OCR_DAILY_LIMIT = 47001     # 超每用户每日识别次数上限（控成本 / 防刷）
+    # 代金券下单核销（48xxx 段）
+    VOUCHER_NOT_FOUND = 48001        # 券不存在
+    VOUCHER_UNUSABLE = 48002         # 券不可用（非代金券 / 已被占用 / 状态不符 / 并发抢锁）
+    VOUCHER_LOCKED = 48003           # 券被其他订单锁定
+    VOUCHER_EXPIRED = 48004          # 券已过期
+    VOUCHER_BELOW_THRESHOLD = 48005  # 未达使用门槛
 
 
 def ok(data=None, msg='ok'):

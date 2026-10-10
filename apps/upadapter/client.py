@@ -69,9 +69,11 @@ def build_dispatch_payload(order, call_back_url=None):
     seatId 和 row/col 时麻花优先用 seatId 校验，过期 seatId 会被拒绝
     （实测 rtnCode=100008）。row/col 是文档推荐口径。
 
-    总限价 costTotalPrice：MAHUA_COST_TOTAL_PRICE 环境变量优先（联调防损/成本护栏，
-    实际成本高于该价时麻花拒绝出单）；未设置时若已有结算价快照则用作上限。
-    放单时结算价通常尚未回填，等于默认不限价——生产建议配置环境变量上限。
+    总限价 costTotalPrice：MAHUA_COST_TOTAL_PRICE 环境变量优先（全局成本护栏，
+    实际成本高于该价麻花拒绝出单）；未设置时取本单票面全价
+    (pay_amount + voucher_amount)——代金券抵扣的是用户侧应付，不减少向麻花的出票成本，
+    故限价须含券金额，否则用券后限价偏低麻花会拒单。
+    注：settle_amount 是放单成功后麻花回调的结算价，放单时尚不可用，不在此参与。
     """
     from django.conf import settings as dj_settings
 
@@ -106,8 +108,13 @@ def build_dispatch_payload(order, call_back_url=None):
             payload['costTotalPrice'] = float(cap)
         except ValueError:
             logger.warning('MAHUA_COST_TOTAL_PRICE 配置非法，忽略: %r', cap)
-    elif order.settle_amount:
-        payload['costTotalPrice'] = order.settle_amount / 100.0  # 分 -> 元
+    else:
+        # 本单票面全价 = 微信实付 + 券抵扣。代金券是平台补贴给用户的抵扣，
+        # 向麻花结算的出票成本不因此减少；限价若只取 pay_amount，用券后偏低，
+        # 麻花会因「实际成本 > costTotalPrice」拒绝出单。
+        cost_fen = (order.pay_amount or 0) + (order.voucher_amount or 0)
+        if cost_fen > 0:
+            payload['costTotalPrice'] = cost_fen / 100.0  # 分 -> 元
     return payload
 
 

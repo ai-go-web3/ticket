@@ -33,6 +33,9 @@ class TicketOrder(models.Model):
     service_fee = models.BigIntegerField(default=0, verbose_name='服务费(分)')
     discount_amount = models.BigIntegerField(default=0, verbose_name='优惠(分)')
     pay_amount = models.BigIntegerField(verbose_name='实付(分,微信现金)')
+    # 观影代金券抵扣：与 discount_amount 分列，便于对账（pay_amount = 票面+服务费-discount-voucher_amount）
+    voucher_no = models.CharField(max_length=64, blank=True, default='', verbose_name='使用的代金券码(空=未用)')
+    voucher_amount = models.BigIntegerField(default=0, verbose_name='代金券抵扣(分)')
     settle_amount = models.BigIntegerField(null=True, verbose_name='结算价(分)')
     # 财务快照：建单时的成本上浮费率与预估成本（Σ原始fastPrice，分）。
     # 实际成本以 settle_amount（麻花 confirmPrice）为准；est_cost 用于选座时点预估与对账差异分析。

@@ -56,6 +56,17 @@ def my_vouchers(request):
 
 
 @api_view(['GET'])
+def usable_vouchers(request):
+    """确认订单页选券：可用于本单金额抵扣的代金券。query: amount(分,用券前应付)。"""
+    amount = request.query_params.get('amount') or 0
+    try:
+        amount = int(amount)
+    except (TypeError, ValueError):
+        amount = 0
+    return ok(services.usable_vouchers(request.user_id, amount))
+
+
+@api_view(['GET'])
 def points_ledger(request):
     """积分明细。query: tab=all|income|expense|expire。"""
     tab = request.query_params.get('tab') or 'all'

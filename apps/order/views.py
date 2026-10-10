@@ -33,6 +33,8 @@ class CreateOrderSerializer(serializers.Serializer):
     discountAmount = serializers.IntegerField(required=False, default=0)
     # 购票方式：tehui 特惠（放单不传 model）/ kuai 快速（放单 model=1 快速通道）
     buyMode = serializers.CharField(required=False, default='tehui')
+    # 观影代金券码（可空）：建单时校验并占用，支付成功核销，关单/退款回滚
+    voucherNo = serializers.CharField(required=False, allow_blank=True, default='')
 
 
 @api_view(['POST'])
@@ -187,4 +189,5 @@ def cancel_order(request, order_id):
     from apps.order.statemachine import transition
     transition(order, TicketOrder.STATUS_CLOSED)
     TicketOrder.objects.filter(id=order.id).update(close_reason='用户主动取消')
+    services.restore_order_voucher(order)
     return ok(None, msg='已取消')

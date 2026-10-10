@@ -38,6 +38,15 @@ def mock_pay(request):
 
 
 @api_view(['POST'])
+def free_pay(request):
+    """0 元订单支付通道（全额代金券抵扣）：不走微信，直接完成支付→出票闭环。"""
+    ser = PaySerializer(data=request.data)
+    ser.is_valid(raise_exception=True)
+    order = services.free_pay_success(ser.validated_data['orderId'], user_id=request.user_id)
+    return ok({'orderId': order.id, 'status': order.status})
+
+
+@api_view(['POST'])
 @permission_classes([AllowAny])
 @authentication_classes([])
 def pay_callback(request):

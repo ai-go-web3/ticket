@@ -257,6 +257,8 @@ def redeem(user_id, item_id, request_id, quantity=1):
             item_id=item.id,
             item_name=item.name,
             category=item.category,
+            value_fen=item.face_value_fen,
+            threshold_fen=item.use_threshold_fen,
             status=Voucher.STATUS_UNUSED,
             expire_at=expire_at,
         ))
@@ -289,6 +291,11 @@ def _voucher_view(v):
         'categoryText': _CATEGORY_TEXT.get(v.category, ''),
         'status': status,
         'statusText': dict(Voucher.STATUS_CHOICES).get(status, ''),
+        'valueFen': v.value_fen,
+        'valueYuan': round(v.value_fen / _FEN_PER_YUAN, 2) if v.value_fen else 0,
+        'thresholdFen': v.threshold_fen,
+        'thresholdYuan': round(v.threshold_fen / _FEN_PER_YUAN, 2) if v.threshold_fen else 0,
+        'orderExtNo': v.order_ext_no or '',
         'expireAt': v.expire_at,
         'createdAt': v.created_at,
     }
@@ -312,6 +319,147 @@ def my_vouchers(user_id, tab='unused'):
         expire_at__lte=now + timedelta(days=15),
     ).count()
     return {'items': items, 'expiringSoon': expiring_soon}
+
+
+# ---------------------------------------------------------------------------
+# 代金券下单核销生命周期（建单锁定 → 支付核销 → 关单/退款回滚）
+# ---------------------------------------------------------------------------
+def usable_vouchers(user_id, amount_fen):
+    """确认订单页选券：返回该用户可用于本单金额抵扣的代金券。
+
+    仅代金券（CAT_VOUCHER）、未使用、未过期参与。按面额降序、同面额临期优先。
+    分成 usable / unusable 两组，unusable 附不可用原因（门槛/面额异常）。
+    金额口径 amount_fen = 本单「用券前应付」（票面+服务费−已有优惠）。
+    """
+    amount_fen = int(amount_fen or 0)
+    now = timezone.now()
+    qs = Voucher.objects.filter(
+        user_id=user_id,
+        category=MallItem.CAT_VOUCHER,
+        status__in=(Voucher.STATUS_UNUSED,),
+        expire_at__gte=now,
+    ).order_by('-value_fen', 'expire_at')
+
+    usable, unusable = [], []
+    for v in qs:
+        d = _voucher_view(v)
+        if v.value_fen <= 0:
+            # 历史券未快照面额：视为不可用（引导重新兑换）
+            d.update(canUse=False, reason='该券暂不支持线上抵扣')
+            unusable.append(d)
+            continue
+        if amount_fen < v.threshold_fen:
+            d.update(canUse=False, reason=f'满¥{(v.threshold_fen + 99) // 100}可用')
+            unusable.append(d)
+            continue
+        d.update(
+            canUse=True,
+            reason='',
+            deductFen=min(v.value_fen, amount_fen),
+            deductYuan=round(min(v.value_fen, amount_fen) / _FEN_PER_YUAN, 2),
+        )
+        usable.append(d)
+    return {'usable': usable, 'unusable': unusable}
+
+
+@transaction.atomic
+def lock_voucher(user_id, voucher_no, order_ext_no, amount_fen):
+    """建单锁券：校验 + 条件更新 UNUSED→LOCKED，返回本单券抵扣额（分）。
+
+    - 行锁 + 条件 UPDATE 防并发双用（同券只有一单能锁定成功）。
+    - 校验不过抛 BizError，由 create_order 事务整体回滚（券不会被误锁）。
+    - 抵扣封顶到本单应付，不为负、不找零：deduct = min(value_fen, amount_fen)。
+    """
+    amount_fen = int(amount_fen or 0)
+    v = Voucher.objects.select_for_update().filter(voucher_no=voucher_no).first()
+    if not v or v.user_id != user_id:
+        raise BizError('卡券不存在', code=ErrorCode.VOUCHER_NOT_FOUND)
+    if v.category != MallItem.CAT_VOUCHER:
+        raise BizError('该券不支持购票抵扣', code=ErrorCode.VOUCHER_UNUSABLE)
+    if v.status == Voucher.STATUS_LOCKED:
+        raise BizError('该券正在被其他订单使用', code=ErrorCode.VOUCHER_UNUSABLE)
+    if v.status != Voucher.STATUS_UNUSED:
+        raise BizError('该券不可用', code=ErrorCode.VOUCHER_UNUSABLE)
+    now = timezone.now()
+    if v.expire_at < now:
+        # 过期只拒用，不改写行状态：@transaction.atomic 下抛出 BizError 会回滚任何写，
+        # 且过期判定已在 usable_vouchers(expire_at__gte=now) / _voucher_view / my_vouchers
+        # 各读路径按 expire_at 惰性生效，无需在此持久化 EXPIRED。
+        raise BizError('该券已过期', code=ErrorCode.VOUCHER_EXPIRED)
+    if amount_fen < v.threshold_fen:
+        raise BizError(
+            f'本单金额未达门槛（满¥{(v.threshold_fen + 99) // 100}可用）',
+            code=ErrorCode.VOUCHER_BELOW_THRESHOLD,
+        )
+    updated = Voucher.objects.filter(
+        id=v.id, status=Voucher.STATUS_UNUSED,
+    ).update(status=Voucher.STATUS_LOCKED, order_ext_no=order_ext_no)
+    if not updated:  # 并发下已被别的单抢锁
+        raise BizError('该券刚被使用，请重选', code=ErrorCode.VOUCHER_UNUSABLE)
+    return max(min(v.value_fen, amount_fen), 0)
+
+
+def _transition(voucher_no, order_ext_no, from_status, to_status, used_at=None):
+    """按 (券码, 订单号, 原状态) 条件迁移券状态；幂等（无匹配行则静默返回）。
+
+    to_status 为 UNUSED 时同时清空 order_ext_no / used_at（回滚到未使用）；
+    to_status 为 USED 时写 used_at。若目标为 UNUSED 但券已过期，改判 EXPIRED。
+    """
+    if not voucher_no:
+        return
+    with transaction.atomic():
+        v = Voucher.objects.select_for_update().filter(
+            voucher_no=voucher_no).first()
+        if not v:
+            return
+        if v.status != from_status or v.order_ext_no != (order_ext_no or ''):
+            # 状态/归属不符：可能已迁移（幂等重放）或被别的单占用，跳过并留痕
+            if not (to_status == Voucher.STATUS_USED and v.status == Voucher.STATUS_USED
+                    and v.order_ext_no == order_ext_no):
+                logger.warning('券状态迁移跳过 no=%s cur=%s want_from=%s order=%s',
+                               voucher_no, v.status, from_status, order_ext_no)
+            return
+        new_status = to_status
+        if to_status == Voucher.STATUS_UNUSED and v.expire_at < timezone.now():
+            new_status = Voucher.STATUS_EXPIRED
+        fields = {'status': new_status}
+        if new_status in (Voucher.STATUS_UNUSED, Voucher.STATUS_EXPIRED):
+            fields.update(order_ext_no='', used_at=None)
+        elif new_status == Voucher.STATUS_USED:
+            fields['used_at'] = used_at or timezone.now()
+        Voucher.objects.filter(id=v.id, status=from_status).update(**fields)
+
+
+@transaction.atomic
+def consume_voucher(voucher_no, order_ext_no):
+    """支付成功核销：LOCKED → USED（幂等）。"""
+    _transition(voucher_no, order_ext_no, Voucher.STATUS_LOCKED, Voucher.STATUS_USED)
+
+
+def release_voucher(voucher_no, order_ext_no):
+    """未支付关单/取消：LOCKED → UNUSED（过期则 EXPIRED，幂等）。"""
+    _transition(voucher_no, order_ext_no, Voucher.STATUS_LOCKED, Voucher.STATUS_UNUSED)
+
+
+def rollback_voucher(voucher_no, order_ext_no):
+    """退款回滚：USED → UNUSED（过期则 EXPIRED，幂等）。"""
+    _transition(voucher_no, order_ext_no, Voucher.STATUS_USED, Voucher.STATUS_UNUSED)
+
+
+def restore_voucher(voucher_no, order_ext_no):
+    """订单终结（关单/取消/退款）统一回滚入口：按券当前状态选对应迁移。
+
+    LOCKED（未支付关单/取消）→ 释放回 UNUSED；USED（已支付后退款）→ 回滚回 UNUSED。
+    先读一次状态再走对应函数，避免 release/rollback 双跑时对不匹配那半打无谓告警。
+    券不存在/状态不符由下游函数幂等处理。
+    """
+    if not voucher_no:
+        return
+    status = Voucher.objects.filter(voucher_no=voucher_no).values_list('status', flat=True).first()
+    if status == Voucher.STATUS_LOCKED:
+        release_voucher(voucher_no, order_ext_no)
+    elif status == Voucher.STATUS_USED:
+        rollback_voucher(voucher_no, order_ext_no)
 
 
 # ---------------------------------------------------------------------------

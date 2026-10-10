@@ -89,7 +89,7 @@ def create_order(user_id, payload):
             s['salePrice'] = sale
         est_cost = est_max if buy_mode == 'kuai' else est_fast
         service_fee = 0
-        goods_due = ticket_amount + service_fee - discount
+        goods_due = ticket_amount + service_fee - discount   # 用券前应付（分）
         if goods_due < 0:
             goods_due = 0
 
@@ -97,14 +97,25 @@ def create_order(user_id, payload):
         from django.conf import settings as dj_settings
         override_fen = int(getattr(dj_settings, 'PAY_AMOUNT_OVERRIDE_FEN', 0) or 0)
 
-        # 积分抵扣购票已下线：积分仅用于卡券兑换，票款一律按现金支付。
-        pay_amount = goods_due
+        # 代金券抵扣：积分抵扣购票已下线，票款一律现金支付，但可用观影代金券减现金。
+        # 先定订单号（锁券需回写占用归属），再在锁券同事务内校验+置 LOCKED，得抵扣额封顶到应付。
+        ext_no = gen_order_ext_no()
+        voucher_no = (payload.get('voucherNo') or '').strip()
+        voucher_amount = 0
+        if voucher_no:
+            from apps.points import services as voucher_services
+            voucher_amount = voucher_services.lock_voucher(
+                user_id, voucher_no, ext_no, goods_due)
+
+        pay_amount = goods_due - voucher_amount
+        if pay_amount < 0:
+            pay_amount = 0
         if override_fen > 0:
             pay_amount = override_fen
 
         # 3. 落单（幂等由微信支付回调 pay_no 幂等 + 放单 outId 幂等兜底）
         order = TicketOrder.objects.create(
-            order_ext_no=gen_order_ext_no(),
+            order_ext_no=ext_no,
             user_id=user_id,
             schedule_id=schedule_id,
             cinema_id=schedule.cinema_id,
@@ -117,6 +128,8 @@ def create_order(user_id, payload):
             service_fee=service_fee,
             discount_amount=discount,
             pay_amount=pay_amount,
+            voucher_no=voucher_no if voucher_amount > 0 else '',
+            voucher_amount=voucher_amount if voucher_amount > 0 else 0,
             mobile=mobile,
             status=TicketOrder.STATUS_PAYING,
             price_rate=rate,
@@ -181,6 +194,16 @@ def mark_paid(order_id, pay_no, amount, callback_raw=None):
 
         # 状态迁移：待付款 -> 出票中
         transition(order, TicketOrder.STATUS_DISPATCHING)
+
+        # 代金券核销：支付成功，占用中(LOCKED)券转已使用(USED)。同事务、幂等；
+        # 绝不因券异常回滚已扣款的支付落库——异常仅记录，放单/退款链路兜底。
+        if order.voucher_no:
+            try:
+                from apps.points import services as voucher_services
+                voucher_services.consume_voucher(order.voucher_no, order.order_ext_no)
+            except Exception as exc:  # noqa: BLE001
+                logger.error('券核销异常 order=%s voucher=%s err=%s',
+                             order.order_ext_no, order.voucher_no, exc)
 
         # 同一事务内：本地生成放单订单 + 调用麻花放单接口 /api/movie-server/movie/put/add
         try:
@@ -277,8 +300,26 @@ def _close_expired(order):
         logger.info('超时关单跳过（状态已变更） order=%s err=%s', order.order_ext_no, exc)
         return False
     TicketOrder.objects.filter(id=order.id).update(close_reason='超时未支付自动关闭')
+    restore_order_voucher(order)
     logger.info('超时未付订单已自动关闭 order=%s', order.order_ext_no)
     return True
+
+
+def restore_order_voucher(order):
+    """订单终结（未支付关单 / 用户取消 / 出票失败退款）回滚代金券。
+
+    券处于占用中(LOCKED)→退回未使用；已核销(USED)→退款回滚未使用；均已过期则转 EXPIRED。
+    由 apps.points.services.restore_voucher 幂等完成。异常吞掉仅记录——
+    券回滚失败绝不得阻断关单/退款主流程。
+    """
+    if not order.voucher_no:
+        return
+    try:
+        from apps.points import services as voucher_services
+        voucher_services.restore_voucher(order.voucher_no, order.order_ext_no)
+    except Exception as exc:  # noqa: BLE001
+        logger.error('订单终结回滚券异常 order=%s voucher=%s err=%s',
+                     order.order_ext_no, order.voucher_no, exc)
 
 
 def close_expired_orders():

@@ -380,6 +380,9 @@ def _do_refund_order(order, refund):
 
     transition(order, TicketOrder.STATUS_REFUNDED)
     TicketOrder.objects.filter(id=order.id).update(pay_status=TicketOrder.PAY_REFUNDED)
+    # 退款成功：把本单核销的代金券退回未使用（幂等，过期则 EXPIRED）
+    from apps.order.services import restore_order_voucher
+    restore_order_voucher(order)
 
 
 def auto_refund_dispatch_fail(order):
@@ -468,6 +471,9 @@ def _settle_refund_to_user(order, refund):
             transition(order, TicketOrder.STATUS_REFUNDED)
         TicketOrder.objects.filter(id=order.id).update(
             pay_status=TicketOrder.PAY_REFUNDED)
+        # 退款到账：回滚本单核销的代金券（幂等，过期则 EXPIRED）
+        from apps.order.services import restore_order_voucher
+        restore_order_voucher(order)
     return refund
 
 

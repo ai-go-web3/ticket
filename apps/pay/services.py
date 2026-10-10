@@ -66,6 +66,15 @@ def unified_order(order_id, openid):
     order = TicketOrder.objects.get(id=order_id)
     cfg = settings.WECHAT
 
+    if order.pay_amount == 0:
+        # 全额代金券抵扣：0 元单无法向微信下单，改走 free_pay 通道（客户端据 zeroPay 触发 /pay/free）
+        return {
+            'zeroPay': True,
+            'orderId': order_id,
+            'orderExtNo': order.order_ext_no,
+            'payAmount': 0,
+        }
+
     if not (cfg.get('MCHID') and cfg.get('PAY_KEY')):
         logger.warning('WX_MCHID/WX_PAY_KEY 未配置，返回模拟支付参数')
         return {
@@ -137,6 +146,28 @@ def mock_pay_success(order_id, user_id=None):
     from apps.order.services import mark_paid
     pay_no = f'MOCK{order.order_ext_no}'
     mark_paid(order.id, pay_no, order.pay_amount, callback_raw={'mock': True})
+    return order
+
+
+def free_pay_success(order_id, user_id=None):
+    """0 元订单（全额代金券抵扣）支付通道：不走微信，直接落 0 元流水 + 触放出票。
+
+    仅当 pay_amount==0 合法；其余金额必须走正常微信支付（unified_order）。
+    pay_no 以 FREE+订单号唯一幂等，重复调用由 mark_paid 幂等兜底不重复放单。
+    """
+    try:
+        order = TicketOrder.objects.get(id=order_id, deleted=0)
+    except TicketOrder.DoesNotExist:
+        raise BizError('订单不存在', code=ErrorCode.ORDER_NOT_EXIST)
+    if user_id is not None and order.user_id != user_id:
+        raise BizError('无权操作该订单', code=ErrorCode.FORBIDDEN)
+    if order.pay_amount != 0:
+        raise BizError('订单金额非 0，请走正常支付', code=ErrorCode.PARAM_ERROR)
+    if order.status != TicketOrder.STATUS_PAYING:
+        return order  # 已支付/已处理：幂等直接返回
+    from apps.order.services import mark_paid
+    pay_no = f'FREE{order.order_ext_no}'
+    mark_paid(order.id, pay_no, 0, callback_raw={'free': True})
     return order
 
 
@@ -340,6 +371,9 @@ def _reconcile_order_on_refund(refund, arrived):
         if order.pay_status != TicketOrder.PAY_REFUNDED:
             TicketOrder.objects.filter(id=order.id).update(
                 pay_status=TicketOrder.PAY_REFUNDED)
+        # 退款到账：把本单核销掉的代金券退回未使用（幂等，过期则 EXPIRED）
+        from apps.order.services import restore_order_voucher
+        restore_order_voucher(order)
         # 退款到账通知：仅真正到账（arrived=True）才发，失败不打扰用户（后台重试兜底）。
         # 快照退款金额/原因，入队幂等(event+order 唯一)。异常吞掉不影响回调解密链路。
         from apps.notify import services as notify_services
