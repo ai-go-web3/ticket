@@ -366,7 +366,18 @@ def schedules(request):
         qs = qs.filter(start_at__date=date)
     qs = qs.order_by('start_at')
 
-    rows = ScheduleSerializer(qs, many=True).data
+    # 折叠同一物理场次（影院+影片+开场时间+影厅）的多渠道 showId：
+    # 麻花可能用不同前缀(CA_/CC_/CF_…)给同一场投多条，保留快照最新的一条——
+    # 实时拉取会刷新「麻花当前在售」场次的 snapshot，故最新≈麻花真正在卖的那条。
+    best = {}
+    for s in qs:
+        key = (s.cinema_id, s.movie_id, s.start_at, s.hall_name)
+        prev = best.get(key)
+        if prev is None or (s.snapshot_at or timezone.min) > (prev.snapshot_at or timezone.min):
+            best[key] = s
+    deduped = sorted(best.values(), key=lambda x: (x.start_at, x.id))
+
+    rows = ScheduleSerializer(deduped, many=True).data
     movies = MovieSerializer(
         Movie.objects.filter(id__in={r['movie_id'] for r in rows}, deleted=0), many=True,
     ).data

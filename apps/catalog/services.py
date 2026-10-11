@@ -22,6 +22,10 @@ logger = logging.getLogger('app')
 SYNC_LOCK_KEY = 'task:sync_movies_lock'
 SYNC_LOCK_TTL = 300  # 秒；异常卡死也会自动释放
 
+# 排片幽灵清理的保护窗口（分钟）：麻花实时列表未再返回、但快照仍在此窗口内的场次先不删，
+# 规避「批量回调刚新增、列表接口尚未同步」的误删竞态。
+SCHEDULE_STALE_GRACE_MIN = 60
+
 
 def sync_cities(city_list):
     """同步麻花城市列表入库。
@@ -271,6 +275,8 @@ def _upsert_schedule(data):
             'maxSpeedPrice': max_speed_price,
         },
         'snapshot_at': timezone.now(),
+        # 麻花仍返回该 showId → 确保存活：若曾被幽灵清理软删，重新出现时自动复活
+        'deleted': 0,
     }
     obj, created = Schedule.objects.update_or_create(
         up_schedule_id=show_id, defaults=defaults,
@@ -719,15 +725,36 @@ def pull_schedules(mahua_cinema_id, up_movie_id=None):
     """实时拉取某影院排片并 upsert 入库。
 
     mahua_cinema_id：麻花 cinemaId。返回 upsert 后本影院（可限影片）的 Schedule 查询集。
+
+    麻花会用不同 showId 前缀（CA_/CC_/CF_… 对应其内部不同数据渠道）投放同一物理场次，
+    且会随时间切换/下线渠道。本函数只做 upsert 会让「麻花已不再返回」的旧 showId 变成
+    幽灵长期残留（同一 21:20 出现多条即由此而来）。故拉取成功后按 showId 差集软删这些幽灵，
+    避免重复展示与误下单。
     """
     client, token = _mahua()
+    pull_started = timezone.now()
     code, data = client.get_schedule(token, mahua_cinema_id)
     rows = data if isinstance(data, list) else (data or {}).get('list') or []
     for item in rows:
         _upsert_schedule(item)
 
-    qs = Schedule.objects.filter(deleted=0)
     cinema = Cinema.objects.filter(up_cinema_id=str(mahua_cinema_id)).first()
+
+    # 幽灵清理：本影院 deleted=0、但麻花本次未再返回、且早于保护窗口的场次 → 软删。
+    # 保护窗口 SCHEDULE_STALE_GRACE_MIN 内的（含批量回调刚新增、列表接口尚未同步的）先不删，
+    # 规避「回调先到、列表滞后」的误删竞态；被误删的若麻花再次返回，_upsert_schedule 会自动复活。
+    seen_ids = {str(it.get('showId')) for it in rows if it.get('showId')}
+    if cinema and seen_ids:
+        cutoff = pull_started - timedelta(minutes=SCHEDULE_STALE_GRACE_MIN)
+        stale_n = (Schedule.objects
+                   .filter(cinema_id=cinema.id, deleted=0, snapshot_at__lt=cutoff)
+                   .exclude(up_schedule_id__in=seen_ids)
+                   .update(deleted=1))
+        if stale_n:
+            logger.info('排片幽灵清理 cinema=%s 软删 %s 条(未在本次实时列表且快照早于 %s)',
+                        mahua_cinema_id, stale_n, cutoff)
+
+    qs = Schedule.objects.filter(deleted=0)
     if cinema:
         qs = qs.filter(cinema_id=cinema.id)
     if up_movie_id:
