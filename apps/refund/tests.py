@@ -251,6 +251,48 @@ class ApplyDisputeTests(TestCase):
         self.assertTrue(dispute.up_dispute_no)
         self.assertTrue(DisputeMsg.objects.filter(dispute_id=dispute.id).exists())
 
+    def _capture_apply(self):
+        """返回 (captured_dict, patcher) —— 捕获传给 dispute_apply 的 kwargs。"""
+        captured = {}
+
+        def _factory(*_a, **_k):
+            client = mock.MagicMock()
+            client.dispute_reason.return_value = ('000000', _MAHUA_CONFIG_OK)
+
+            def _apply(*_args, **kwargs):
+                captured.update(kwargs)
+                return ('000000', {'disputeId': '321', 'evaluateRefundFee': 5})
+            client.dispute_apply.side_effect = _apply
+            return client
+
+        return captured, mock.patch('apps.upadapter.mahua.MahuaClient', new=_factory)
+
+    def test_apply_uses_dispute_callback_url(self):
+        """纠纷回调必须走独立的 /callback/dispute（回归：不得复用订单地址）。"""
+        from django.conf import settings as dj_settings
+        from apps.refund.services import apply_dispute
+        order = _make_wait_pick_order(ext_no='PP2026100700020')
+        captured, patcher = self._capture_apply()
+        with mock.patch.dict(dj_settings.MAHUA, {
+                'CALLBACK_URL': 'https://h/api/v1/up/callback/order',
+                'DISPUTE_CALLBACK_URL': 'https://h/api/v1/up/callback/dispute'}), patcher:
+            apply_dispute(order.user_id, order.id, '个人原因申请退票', 'x')
+        self.assertEqual(captured.get('call_back_url'),
+                         'https://h/api/v1/up/callback/dispute')
+
+    def test_apply_derives_dispute_callback_when_unconfigured(self):
+        """未配置纠纷地址时，从订单地址派生 /callback/dispute 兜底（防回归）。"""
+        from django.conf import settings as dj_settings
+        from apps.refund.services import apply_dispute
+        order = _make_wait_pick_order(ext_no='PP2026100700021')
+        captured, patcher = self._capture_apply()
+        with mock.patch.dict(dj_settings.MAHUA, {
+                'CALLBACK_URL': 'https://h/api/v1/up/callback/order',
+                'DISPUTE_CALLBACK_URL': ''}), patcher:
+            apply_dispute(order.user_id, order.id, '个人原因申请退票', 'x')
+        self.assertEqual(captured.get('call_back_url'),
+                         'https://h/api/v1/up/callback/dispute')
+
     def test_apply_rejects_invalid_reason(self):
         """原因不在麻花 reasons 列表内：拒绝。"""
         order = _make_wait_pick_order(ext_no='PP20261007000012')

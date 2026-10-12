@@ -296,13 +296,22 @@ def _dispute_refund(order, reason_code, content=None):
 
     client = MahuaClient()
     token = get_token()
+    # 纠纷回调地址：必须用独立的 DISPUTE_CALLBACK_URL(/callback/dispute)，不能复用订单地址。
+    # 若误传到 /callback/order，纠纷报文（无 status 字段）会落进 on_order_callback，
+    # 被当失败状态覆盖放单记录，且 on_dispute_callback 永不触发（见 settings.MAHUA 注释）。
+    # 未显式配置时，从订单回调地址派生（.../callback/order -> .../callback/dispute）兜底。
+    dispute_cb = dj_settings.MAHUA.get('DISPUTE_CALLBACK_URL') or ''
+    if not dispute_cb:
+        order_cb = dj_settings.MAHUA.get('CALLBACK_URL') or ''
+        if order_cb.endswith('/callback/order'):
+            dispute_cb = order_cb[:-len('/order')] + '/dispute'
     code, data = client.dispute_apply(
         token,
         out_id=order.order_ext_no,   # 外部单号（我方订单号）
         reason=reason_code,
         content=content,
         out_dispute_id=out_dispute_id,
-        call_back_url=dj_settings.MAHUA.get('CALLBACK_URL') or None,
+        call_back_url=dispute_cb or None,
     )
     if code != SUCCESS_CODE:
         logger.error('发起纠纷失败 order=%s code=%s data=%s', order.order_ext_no, code, data)

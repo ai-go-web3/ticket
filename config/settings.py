@@ -166,8 +166,12 @@ MAHUA = {
     # 因此默认关闭：关闭时 dispatch() 只构造并落库真实放单报文（dry-run），不发起扣款请求。
     # 确认账户/回调就绪后，设环境变量 MAHUA_DISPATCH_ENABLED=true 才会真正调用 /put/add。
     'DISPATCH_ENABLED': os.environ.get('MAHUA_DISPATCH_ENABLED', 'false').lower() == 'true',
-    # 麻花放单回调地址（必须 http 开头，公网可达）。本地开发收不到回调，靠查询轮询收敛。
+    # 麻花放单/订单回调地址（必须 http 开头，公网可达）。本地开发收不到回调，靠查询轮询收敛。
     'CALLBACK_URL': os.environ.get('MAHUA_CALLBACK_URL', ''),
+    # 麻花纠纷回调地址：纠纷单完结通知推到这里（/callback/dispute -> on_dispute_callback）。
+    # 必须与订单回调地址分开！若复用 CALLBACK_URL(/callback/order)，纠纷报文（无 status 字段）
+    # 会误入 on_order_callback，被当失败状态覆盖放单记录，且 on_dispute_callback 永不触发。
+    'DISPUTE_CALLBACK_URL': os.environ.get('MAHUA_DISPUTE_CALLBACK_URL', ''),
     # 放单总限价（元，costTotalPrice 字段）：实际出票成本高于该价时麻花拒绝出单。
     # 联调防损：设 0.01 可保证真实放单永远不成功（订单走「出票失败 -> 自动退款」，
     # 麻花余额零扣款）。留空 = 不传该字段；生产建议按业务设一个合理成本上限。
