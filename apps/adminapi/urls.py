@@ -1,6 +1,6 @@
 from django.urls import path
 
-from apps.adminapi import views_auth, views_dashboard, views_orders, views_recon, views_rules, views_refdata, views_recommend, views_media, views_points_mall, views_member_level
+from apps.adminapi import views_auth, views_dashboard, views_orders, views_recon, views_rules, views_refdata, views_recommend, views_media, views_points_mall, views_member_level, views_members
 
 urlpatterns = [
     # 登录（唯一免鉴权）
@@ -69,6 +69,13 @@ urlpatterns = [
     path('member-levels/<int:level_id>/update', views_member_level.level_update),
     path('member-levels/<int:level_id>/toggle', views_member_level.level_toggle),
     path('member-levels/<int:level_id>/delete', views_member_level.level_delete),
+
+    # 会员管理（AppUser + Wallet 聚合 · 查看/筛选/冻结）
+    path('members', views_members.members),
+    path('members/status-count', views_members.members_status_count),
+    path('members/<int:member_id>', views_members.member_detail),
+    path('members/<int:member_id>/freeze', views_members.member_freeze),
+    path('members/<int:member_id>/unfreeze', views_members.member_unfreeze),
 
     # 图片上传（存 MySQL）：供首页装修横版封面 / 横幅底图上传
     path('media/upload', views_media.media_upload),

@@ -35,6 +35,8 @@ class CreateOrderSerializer(serializers.Serializer):
     buyMode = serializers.CharField(required=False, default='tehui')
     # 观影代金券码（可空）：建单时校验并占用，支付成功核销，关单/退款回滚
     voucherNo = serializers.CharField(required=False, allow_blank=True, default='')
+    # 系统调座：用户是否接受调座（默认不接受）；放单时映射为麻花 acceptChangeseat
+    acceptReassign = serializers.BooleanField(required=False, default=False)
 
 
 @api_view(['POST'])

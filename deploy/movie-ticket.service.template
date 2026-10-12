@@ -1,0 +1,74 @@
+# =============================================================================
+# 拼拼电影票 后端 · systemd 服务单元模板（裸机 gunicorn，非 Docker）
+#
+# 安装：
+#   1) 全局替换尖括号占位符（见下），另存为 /etc/systemd/system/<SERVICE>.service
+#   2) 首次确保 venv 里装了 gunicorn（requirements.txt 未含，Docker 才额外装）：
+#        <VENV>/bin/pip install gunicorn
+#   3) sudo systemctl daemon-reload
+#      sudo systemctl enable --now <SERVICE>.service
+#   4) 之后发版走 ticket/deploy/deploy.sh（SYSTEMD_SERVICE=<SERVICE> ./deploy.sh），
+#      或手动：sudo systemctl restart <SERVICE>.service
+#
+# 占位符（替换成你机器上的真实值）：
+#   <SERVICE>   服务名，如 movie-ticket
+#   <USER>      运行用户，如 www-data / ubuntu（不要用 root）
+#   <APP_DIR>   ticket/ 仓库根（含 manage.py），如 /srv/ticket
+#               ⚠️ WorkingDirectory 必须=APP_DIR：settings.py 里 load_dotenv(BASE_DIR/'.env')
+#                 靠它找到 .env（含 MYSQL_ADDRESS 等），否则连不上库/凭证为空。
+#   <VENV>      虚拟环境目录，如 /srv/ticket/venv
+#   <BIND>      gunicorn 监听地址：裸机+Nginx 反代建议 127.0.0.1:8000（勿直暴公网）；
+#               直连公网才用 0.0.0.0:80（需前置防火墙只放 80/443 给 Nginx）。
+#
+# 关键约束（勿改）：
+#   --workers 1  必守：APScheduler 在 app.ready() 内起内置定时器（影片同步/麻花token刷新），
+#                多 worker 会各起一个调度器→重复执行/重复放单。并发靠 --threads 提。
+#   --preload    保留：省内存+起调度器；但代码更新后 SIGHUP 热重载不生效，
+#                必须整体 restart（systemctl restart 正好做到，deploy.sh 也走这条）。
+#   ExecStartPre=migrate：起服务前先把库结构对齐（双保险；deploy.sh 里已 migrate 一次，
+#                这里幂等，主要兜住"机器重启/直接 systemctl start"这类没经 deploy 的路径）。
+#                migrate 失败 → 非 0 → 服务不启动（fail-fast），不带残缺 schema 对外服务。
+# =============================================================================
+
+[Unit]
+Description=PinPin Movie Ticket Django backend (gunicorn)
+After=network-online.target mysql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<USER>
+Group=<USER>
+WorkingDirectory=<APP_DIR>
+
+# Django 自行从 WorkingDirectory/.env 读取配置；这里只显式声明必需的非敏感项。
+# 如需系统级覆盖，可放开下一行（注意 .env 含密码，权限须 600，属主=<USER>）：
+# EnvironmentFile=<APP_DIR>/.env
+Environment=DJANGO_SETTINGS_MODULE=config.settings
+Environment=PYTHONUNBUFFERED=1
+
+# 启动前：对齐数据库结构（幂等）+ 收静态（失败不阻断，兜底）
+ExecStartPre=<VENV>/bin/python manage.py migrate --noinput
+ExecStartPre=-<VENV>/bin/python manage.py collectstatic --noinput
+
+ExecStart=<VENV>/bin/gunicorn config.wsgi:application \
+    --bind <BIND> \
+    --workers 1 \
+    --threads 8 \
+    --timeout 60 \
+    --preload \
+    --access-logfile - \
+    --error-logfile -
+
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=30
+GuessMainPID=yes
+
+# 适度加固（按需增减；PrivateTmp 若与本机 socket/路径有耦合可去掉）
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

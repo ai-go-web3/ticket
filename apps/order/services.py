@@ -34,6 +34,8 @@ def create_order(user_id, payload):
     seats = payload['seats']
     mobile = payload.get('mobile') or ''
     discount = payload.get('discountAmount', 0)
+    # 系统调座：用户勾选结果（默认不接受）；放单时映射为麻花 acceptChangeseat
+    accept_reassign = bool(payload.get('acceptReassign', False))
 
     # 取票手机号：接口不再回传明文手机号，客户端通常不带 mobile，
     # 这里回落到登录用户绑定的手机号（服务端库内），保证麻花出票拿得到取票号。
@@ -135,6 +137,7 @@ def create_order(user_id, payload):
             price_rate=rate,
             est_cost_amount=est_cost or None,
             buy_mode=buy_mode,
+            accept_reassign=accept_reassign,
         )
 
         # 订阅消息：入队「催付」定时提醒（到点=付款倒计时剩 ~N 分钟，发送前复检是否仍未支付）。

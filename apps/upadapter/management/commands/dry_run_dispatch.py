@@ -120,7 +120,8 @@ class Command(BaseCommand):
             'outId': f'DRYRUN{int(time.time() * 1000)}',
             'showId': show_id,
             'buySeats': [buy_seat],
-            'acceptChangeseat': '1',
+            # 真实放单按用户勾选映射（缺省不接受=0），dry-run 无勾选 → 与默认一致置 0
+            'acceptChangeseat': '0',
             'callBackUrl': 'https://REPLACE-WITH-PUBLIC-HOST/api/v1/upadapter/order-callback',
             'costTotalPrice': cost,
             'model': opts['model'],

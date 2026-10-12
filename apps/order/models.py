@@ -43,6 +43,9 @@ class TicketOrder(models.Model):
     est_cost_amount = models.BigIntegerField(null=True, verbose_name='预估成本(分,Σ原始fastPrice)')
     # 购票模式：tehui=特惠（放单不传 model，麻花默认 0）；kuai=快速（放单 model=1 快速通道）
     buy_mode = models.CharField(max_length=8, default='tehui', verbose_name='购票模式')
+    # 系统调座：用户是否接受调座（前端勾选随单下发）。True→放单 acceptChangeseat='1'(可调)，
+    # False→'0'(不可调)。默认不接受，值以用户勾选为准。
+    accept_reassign = models.BooleanField(default=False, verbose_name='是否接受系统调座')
     mobile = models.CharField(max_length=20, verbose_name='取票手机')
     status = models.SmallIntegerField(verbose_name='状态')
     pay_status = models.SmallIntegerField(default=0, verbose_name='0未付 1已付 2已退')

@@ -91,7 +91,8 @@ def build_dispatch_payload(order, call_back_url=None):
         'outId': order.order_ext_no,
         'showId': order.up_schedule_id,
         'buySeats': buy_seats,
-        'acceptChangeseat': '1',
+        # 是否可调座：以用户勾选为准（order.accept_reassign），麻花口径 1-可调 0-不可调；缺省不接受
+        'acceptChangeseat': '1' if getattr(order, 'accept_reassign', False) else '0',
     }
     # 出票模式（0特惠/1快速/2极速，见放单文档 §4.1）：特惠不传（麻花默认 0），
     # 快速购票单传 model=1 快速通道，与用户所购模式一致
